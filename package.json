@@ -12,7 +12,9 @@
     "dist:win": "npm run build:all && electron-builder --win",
     "dist:win:dir": "npm run build:all && electron-builder --win --dir",
     "dist:linux": "npm run build:all && electron-builder --linux",
-    "dist:dir": "npm run build:all && electron-builder --dir"
+    "dist:dir": "npm run build:all && electron-builder --dir",
+    "release:zip": "npm run dist:win:dir && node scripts/create-release-zip.js",
+    "release:pack": "npm run dist:win:dir && node scripts/create-release-zip.js"
   },
   "keywords": [
     "gaming",
