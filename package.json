@@ -1,0 +1,75 @@
+{
+  "name": "epoch-trailmap",
+  "version": "1.0.0",
+  "description": "Tactical rolling buffer video annotation and review utility for competitive gamers",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "build:electron": "tsc -p tsconfig.electron.json",
+    "electron:dev": "concurrently -k \"vite\" \"wait-on tcp:5173 && electron .\"",
+    "build:all": "npm run build && npm run build:electron",
+    "dist:win": "npm run build:all && electron-builder --win",
+    "dist:win:dir": "npm run build:all && electron-builder --win --dir",
+    "dist:linux": "npm run build:all && electron-builder --linux",
+    "dist:dir": "npm run build:all && electron-builder --dir"
+  },
+  "keywords": [
+    "gaming",
+    "clipping",
+    "tactical-overlay",
+    "rolling-buffer",
+    "screen-annotation",
+    "esports"
+  ],
+  "author": "Epoch Trail Team",
+  "license": "MIT",
+  "dependencies": {
+    "clsx": "^2.1.1",
+    "fix-webm-duration": "^1.0.6",
+    "lucide-react": "^1.16.0",
+    "mp4-muxer": "^5.2.2",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tailwind-merge": "^3.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.4",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.4.20",
+    "concurrently": "^9.1.2",
+    "cross-env": "^7.0.3",
+    "electron": "^34.2.0",
+    "electron-builder": "^25.1.8",
+    "postcss": "^8.5.2",
+    "tailwindcss": "^3.4.17",
+    "typescript": "^5.7.3",
+    "vite": "^6.1.0",
+    "wait-on": "^8.0.2"
+  },
+  "build": {
+    "appId": "com.epoch.trail",
+    "productName": "Epoch Trail",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "public/**/*",
+      "trailmap_icon.png"
+    ],
+    "win": {
+      "target": [
+        "dir"
+      ],
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}

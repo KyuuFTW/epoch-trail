@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Epoch Moments Overlay</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    body {
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
+      background: transparent;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      padding-right: 12px;
+    }
+    .moment-card {
+      width: 320px;
+      height: 68px;
+      background: rgba(10, 14, 23, 0.95);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid rgba(0, 240, 255, 0.45);
+      border-radius: 14px;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.7), 0 0 20px rgba(0, 240, 255, 0.25), inset 0 1px 0 rgba(255, 255, 255, 0.15);
+      display: flex;
+      align-items: center;
+      padding: 0 14px;
+      gap: 12px;
+      position: relative;
+      overflow: hidden;
+      transform: translateX(120%);
+      opacity: 0;
+      transition: all 0.35s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .moment-card.show {
+      transform: translateX(0);
+      opacity: 1;
+    }
+    .moment-icon-box {
+      width: 42px;
+      height: 42px;
+      border-radius: 10px;
+      background: rgba(0, 240, 255, 0.1);
+      border: 1px solid rgba(0, 240, 255, 0.3);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      box-shadow: 0 0 12px rgba(0, 240, 255, 0.2);
+    }
+    .moment-icon-box img {
+      width: 32px;
+      height: 32px;
+      object-fit: contain;
+    }
+    .moment-content {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-col;
+      flex-direction: column;
+      justify-content: center;
+      gap: 2px;
+    }
+    .moment-header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .moment-badge {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: #00f0ff;
+      box-shadow: 0 0 8px #00f0ff;
+      animation: pulse 1.5s infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.4; transform: scale(0.85); }
+    }
+    .moment-title {
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: #00f0ff;
+      font-family: 'JetBrains Mono', 'Consolas', monospace;
+    }
+    .moment-subtitle {
+      font-size: 12px;
+      font-weight: 600;
+      color: #ffffff;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .moment-desc {
+      font-size: 10px;
+      color: #94a3b8;
+      font-family: 'JetBrains Mono', 'Consolas', monospace;
+    }
+    /* Progress bar along the bottom */
+    .moment-progress-track {
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      height: 3px;
+      background: rgba(0, 0, 0, 0.5);
+    }
+    .moment-progress-bar {
+      height: 100%;
+      width: 100%;
+      background: linear-gradient(90deg, #0072ff, #00f0ff);
+      transition: width 3.2s linear;
+    }
+  </style>
+</head>
+<body>
+  <div class="moment-card" id="card">
+    <div class="moment-icon-box">
+      <img src="icon.png" alt="Epoch Trail">
+    </div>
+    <div class="moment-content">
+      <div class="moment-header">
+        <div class="moment-badge"></div>
+        <div class="moment-title" id="title">MOMENT CAPTURED</div>
+      </div>
+      <div class="moment-subtitle" id="subtitle">60.0s Gameplay Clip</div>
+      <div class="moment-desc" id="desc">Saved to Clip Vault</div>
+    </div>
+    <div class="moment-progress-track">
+      <div class="moment-progress-bar" id="prog"></div>
+    </div>
+  </div>
+
+  <script>
+    const card = document.getElementById('card');
+    const titleEl = document.getElementById('title');
+    const subtitleEl = document.getElementById('subtitle');
+    const descEl = document.getElementById('desc');
+    const progEl = document.getElementById('prog');
+
+    let hideTimer = null;
+
+    window.electronAPI?.onToastMessage((data) => {
+      showToast(data);
+    });
+
+    // Support direct IPC if exposed
+    if (window.ipcRenderer) {
+      window.ipcRenderer.on('show-moment-toast', (event, data) => {
+        showToast(data);
+      });
+    }
+
+    function showToast(data) {
+      if (hideTimer) clearTimeout(hideTimer);
+
+      titleEl.textContent = data.title || 'MOMENT CAPTURED';
+      subtitleEl.textContent = data.subtitle || 'Gameplay Clip Saved';
+      descEl.textContent = data.desc || 'Saved to Clip Vault';
+
+      progEl.style.transition = 'none';
+      progEl.style.width = '100%';
+      card.classList.remove('show');
+
+      requestAnimationFrame(() => {
+        card.classList.add('show');
+        requestAnimationFrame(() => {
+          progEl.style.transition = 'width 3.2s linear';
+          progEl.style.width = '0%';
+        });
+      });
+
+      hideTimer = setTimeout(() => {
+        card.classList.remove('show');
+      }, 3500);
+    }
+  </script>
+</body>
+</html>
