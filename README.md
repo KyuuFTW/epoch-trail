@@ -4,6 +4,9 @@
 
 ![Epoch Trail Logo](public/icon.png)
 
+> [!NOTE]
+> **🤖 100% AI-Generated Codebase**: The entire codebase, Electron/Chromium architecture, WebCodecs circular buffer engine, Web Audio DSP filters, vector telestrator canvas, UI components, and technical documentation of this repository were designed, developed, and generated entirely by AI.
+
 ---
 
 ## 📖 Table of Contents
