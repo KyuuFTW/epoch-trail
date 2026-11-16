@@ -243,13 +243,14 @@ export class RollingBufferService {
         }
       }
 
-      // Mix Microphone and System audio
-      const mixedAudioTrack = await audioMixer.initAudioMixer(rawAudioTrack);
-      const captureAudioTrack = mixedAudioTrack || rawAudioTrack;
+      // Acquire separated Window/System Audio (unfiltered) and Microphone Audio (isolated DSP)
+      const separatedAudio = await audioMixer.prepareAudioTracks(rawAudioTrack);
+      const activeGameForWebm = audioMixer.getConfig().isGameAudioMuted ? null : separatedAudio.gameAudioTrack;
+      const fallbackSingleAudio = activeGameForWebm || separatedAudio.micAudioTrack;
 
       const compositeTracks: MediaStreamTrack[] = [videoTrack];
-      if (captureAudioTrack) {
-        compositeTracks.push(captureAudioTrack);
+      if (fallbackSingleAudio) {
+        compositeTracks.push(fallbackSingleAudio);
       }
       this.mediaStream = new MediaStream(compositeTracks);
 
@@ -267,7 +268,7 @@ export class RollingBufferService {
         }
         try {
           this.mp4Encoder = new Mp4RollingEncoder(this.config.durationSeconds, targetFps);
-          await this.mp4Encoder.start(videoTrack, captureAudioTrack);
+          await this.mp4Encoder.start(videoTrack, separatedAudio);
           this.actualFormat = 'mp4';
           this.actualMimeType = 'video/mp4';
         } catch (mp4Error) {
@@ -383,6 +384,8 @@ export class RollingBufferService {
       try {
         const snapshot = await this.mp4Encoder.snapshot();
         const videoBlobUrl = URL.createObjectURL(snapshot.blob);
+        const gameAudioUrl = snapshot.gameAudioBlob ? URL.createObjectURL(snapshot.gameAudioBlob) : undefined;
+        const micAudioUrl = snapshot.micAudioBlob ? URL.createObjectURL(snapshot.micAudioBlob) : undefined;
         return {
           id: `clip_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
           name: `Clip #${this.clipCounter} (${timeFormatted.replace(/:/g, '-')})`,
@@ -391,6 +394,10 @@ export class RollingBufferService {
           dateFormatted,
           videoBlobUrl,
           blob: snapshot.blob,
+          gameAudioUrl,
+          micAudioUrl,
+          gameAudioBlob: snapshot.gameAudioBlob,
+          micAudioBlob: snapshot.micAudioBlob,
           duration: Math.round(snapshot.durationSeconds * 10) / 10,
           format: 'mp4',
           mimeType: 'video/mp4',

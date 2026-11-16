@@ -356,6 +356,7 @@ app.whenReady().then(() => {
         const fileSize = stat.size;
         const ext = path.extname(targetPath).toLowerCase();
         const mimeType = ext === '.mp4' ? 'video/mp4'
+          : ext === '.m4a' ? 'audio/mp4'
           : ext === '.webm' ? 'video/webm'
           : ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg'
           : ext === '.png' ? 'image/png'
@@ -627,6 +628,7 @@ ipcMain.handle('list-vault-files', async (_event, targetDir?: string) => {
     if (!fs.existsSync(thumbDir)) {
       fs.mkdirSync(thumbDir, { recursive: true });
     }
+    const audioDir = path.join(dir, '.epoch_audio');
 
     const files = await fs.promises.readdir(dir);
     const videoFiles = files.filter(f => f.endsWith('.webm') || f.endsWith('.mp4') || f.endsWith('.mkv'));
@@ -645,6 +647,10 @@ ipcMain.handle('list-vault-files', async (_event, targetDir?: string) => {
 
         const thumbPath = path.join(thumbDir, `${fileName}.jpg`);
         const hasThumb = fs.existsSync(thumbPath);
+        const gameAudioPath = path.join(audioDir, `${fileName}.game.m4a`);
+        const micAudioPath = path.join(audioDir, `${fileName}.mic.m4a`);
+        const hasGameAudio = fs.existsSync(gameAudioPath);
+        const hasMicAudio = fs.existsSync(micAudioPath);
 
         return {
           id: `disk_${fileName.replace(/[^a-zA-Z0-9]/g, '_')}`,
@@ -658,6 +664,8 @@ ipcMain.handle('list-vault-files', async (_event, targetDir?: string) => {
           mimeType,
           mediaUrl: `epoch-media://get?path=${encodeURIComponent(fullPath)}`,
           thumbnailUrl: hasThumb ? `epoch-media://get?path=${encodeURIComponent(thumbPath)}` : undefined,
+          gameAudioUrl: hasGameAudio ? `epoch-media://get?path=${encodeURIComponent(gameAudioPath)}` : undefined,
+          micAudioUrl: hasMicAudio ? `epoch-media://get?path=${encodeURIComponent(micAudioPath)}` : undefined,
           format: isMp4 ? 'mp4' : 'webm',
         };
       })
@@ -690,10 +698,58 @@ ipcMain.handle('save-clip-thumbnail', async (_event, fileName: string, base64Dat
   }
 });
 
+// Save separated Window & Mic audio companion tracks to .epoch_audio/
+ipcMain.handle(
+  'save-clip-audio-tracks',
+  async (
+    _event,
+    fileName: string,
+    tracks: { gameAudioData?: Uint8Array; micAudioData?: Uint8Array },
+    targetDir?: string,
+  ) => {
+    try {
+      const dir = targetDir || getDefaultVaultDirectory();
+      const audioDir = path.join(dir, '.epoch_audio');
+      if (!fs.existsSync(audioDir)) {
+        fs.mkdirSync(audioDir, { recursive: true });
+      }
+      const result: { gameAudioUrl?: string; micAudioUrl?: string } = {};
+      if (tracks?.gameAudioData && tracks.gameAudioData.byteLength > 0) {
+        const gamePath = path.join(audioDir, `${fileName}.game.m4a`);
+        await fs.promises.writeFile(gamePath, Buffer.from(tracks.gameAudioData));
+        result.gameAudioUrl = `epoch-media://get?path=${encodeURIComponent(gamePath)}`;
+      }
+      if (tracks?.micAudioData && tracks.micAudioData.byteLength > 0) {
+        const micPath = path.join(audioDir, `${fileName}.mic.m4a`);
+        await fs.promises.writeFile(micPath, Buffer.from(tracks.micAudioData));
+        result.micAudioUrl = `epoch-media://get?path=${encodeURIComponent(micPath)}`;
+      }
+      return result;
+    } catch (err) {
+      logToFile(`Failed to save clip audio tracks: ${err}`);
+      return null;
+    }
+  },
+);
+
 // Delete a clip file from disk (and move to Recycle Bin)
 ipcMain.handle('delete-vault-file', async (_event, filePath: string) => {
   try {
     if (!filePath) return false;
+    const dir = path.dirname(filePath);
+    const baseName = path.basename(filePath);
+    const companions = [
+      path.join(dir, '.epoch_thumbnails', `${baseName}.jpg`),
+      path.join(dir, '.epoch_audio', `${baseName}.game.m4a`),
+      path.join(dir, '.epoch_audio', `${baseName}.mic.m4a`),
+    ];
+    for (const companion of companions) {
+      try {
+        if (fs.existsSync(companion)) {
+          await fs.promises.unlink(companion);
+        }
+      } catch {}
+    }
     if (fs.existsSync(filePath)) {
       await shell.trashItem(filePath);
       return true;
@@ -719,12 +775,35 @@ ipcMain.handle('rename-vault-file', async (_event, oldFilePath: string, newNameW
     if (!oldFilePath || !fs.existsSync(oldFilePath)) return null;
 
     const dir = path.dirname(oldFilePath);
+    const oldBaseName = path.basename(oldFilePath);
     const ext = path.extname(oldFilePath);
     const safeBaseName = newNameWithoutExt.replace(/[^a-zA-Z0-9_\- ]/g, '_').trim();
-    const newFullPath = path.join(dir, `${safeBaseName}${ext}`);
+    const newBaseName = `${safeBaseName}${ext}`;
+    const newFullPath = path.join(dir, newBaseName);
 
     if (oldFilePath !== newFullPath) {
       await fs.promises.rename(oldFilePath, newFullPath);
+      const companionPairs = [
+        [
+          path.join(dir, '.epoch_thumbnails', `${oldBaseName}.jpg`),
+          path.join(dir, '.epoch_thumbnails', `${newBaseName}.jpg`),
+        ],
+        [
+          path.join(dir, '.epoch_audio', `${oldBaseName}.game.m4a`),
+          path.join(dir, '.epoch_audio', `${newBaseName}.game.m4a`),
+        ],
+        [
+          path.join(dir, '.epoch_audio', `${oldBaseName}.mic.m4a`),
+          path.join(dir, '.epoch_audio', `${newBaseName}.mic.m4a`),
+        ],
+      ];
+      for (const [oldComp, newComp] of companionPairs) {
+        try {
+          if (fs.existsSync(oldComp)) {
+            await fs.promises.rename(oldComp, newComp);
+          }
+        } catch {}
+      }
     }
     return newFullPath;
   } catch (err) {

@@ -62,6 +62,7 @@ export const App: React.FC = () => {
   // Buffer & Recording State (DEFAULT TO NOT BUFFERING ON LAUNCH)
   const [isBuffering, setIsBuffering] = useState<boolean>(false);
   const [config, setConfig] = useState<BufferConfig>(StorageManager.loadConfig());
+  const [audioConfig, setAudioConfig] = useState<AudioConfig>(StorageManager.loadAudioConfig());
   const [captureSource, setCaptureSource] = useState<CaptureSourceConfig>(StorageManager.loadCaptureSource());
   const [metrics, setMetrics] = useState<BufferMetrics>({
     ...rollingBuffer.getMetrics(),
@@ -74,6 +75,8 @@ export const App: React.FC = () => {
 
   // Active Video Player State (Used during Vault Clip Review)
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const gameAudioRef = useRef<HTMLAudioElement | null>(null);
+  const micAudioRef = useRef<HTMLAudioElement | null>(null);
   const [currentTime, setCurrentTime] = useState<number>(0);
   const [duration, setDuration] = useState<number>(60);
   const [trimRange, setTrimRange] = useState<[number, number]>([0, 60]);
@@ -84,6 +87,8 @@ export const App: React.FC = () => {
   const [playbackRate, setPlaybackRate] = useState<number>(1.0);
   const [playbackVolume, setPlaybackVolume] = useState<number>(1.0);
   const [isPlaybackMuted, setIsPlaybackMuted] = useState<boolean>(false);
+  const [isReviewGameAudioEnabled, setIsReviewGameAudioEnabled] = useState<boolean>(true);
+  const [isReviewMicAudioEnabled, setIsReviewMicAudioEnabled] = useState<boolean>(true);
   const animFrameRef = useRef<number | null>(null);
 
   // Tactical Annotation Engine State
@@ -102,6 +107,7 @@ export const App: React.FC = () => {
 
   // Find active clip
   const activeClip = clips.find(c => c.id === activeClipId) || null;
+  const hasSeparatedReviewAudio = Boolean(activeClip?.gameAudioUrl || activeClip?.micAudioUrl);
 
   // Scan and load all clip files from disk directory into Vault Gallery
   const refreshVaultFromDisk = useCallback(async (targetDir?: string) => {
@@ -120,6 +126,8 @@ export const App: React.FC = () => {
               dateFormatted: df.dateFormatted,
               videoBlobUrl: videoUrl,
               thumbnailUrl: df.thumbnailUrl,
+              gameAudioUrl: df.gameAudioUrl,
+              micAudioUrl: df.micAudioUrl,
               blob: new Blob([], { type: df.mimeType }),
               duration: 60, // Refreshed dynamically on metadata load
               format: df.format,
@@ -174,25 +182,54 @@ export const App: React.FC = () => {
     };
   }, []);
 
+  const syncSeparatedAudioSettings = useCallback(() => {
+    if (gameAudioRef.current) {
+      gameAudioRef.current.muted = isPlaybackMuted || !isReviewGameAudioEnabled;
+      gameAudioRef.current.volume = playbackVolume;
+      gameAudioRef.current.playbackRate = playbackRate;
+    }
+    if (micAudioRef.current) {
+      micAudioRef.current.muted = isPlaybackMuted || !isReviewMicAudioEnabled;
+      micAudioRef.current.volume = playbackVolume;
+      micAudioRef.current.playbackRate = playbackRate;
+    }
+  }, [isPlaybackMuted, isReviewGameAudioEnabled, isReviewMicAudioEnabled, playbackVolume, playbackRate]);
+
   // Reload video and ensure audio is active when activeClip changes
   useEffect(() => {
+    setIsReviewGameAudioEnabled(true);
+    setIsReviewMicAudioEnabled(true);
     if (activeClip && videoRef.current) {
       videoRef.current.load();
       videoRef.current.currentTime = 0;
-      videoRef.current.muted = isPlaybackMuted;
+      videoRef.current.muted = hasSeparatedReviewAudio ? true : isPlaybackMuted;
       videoRef.current.volume = playbackVolume;
+      videoRef.current.playbackRate = playbackRate;
+      if (gameAudioRef.current) {
+        gameAudioRef.current.load();
+        gameAudioRef.current.currentTime = 0;
+      }
+      if (micAudioRef.current) {
+        micAudioRef.current.load();
+        micAudioRef.current.currentTime = 0;
+      }
       setCurrentTime(0);
       setDuration(activeClip.duration || 60);
     }
   }, [activeClipId]);
 
   useEffect(() => {
-    if (!videoRef.current) return;
-    videoRef.current.muted = isPlaybackMuted;
-    videoRef.current.volume = playbackVolume;
-  }, [isPlaybackMuted, playbackVolume]);
+    if (videoRef.current) {
+      videoRef.current.muted = hasSeparatedReviewAudio
+        ? true
+        : (isPlaybackMuted || !isReviewGameAudioEnabled);
+      videoRef.current.volume = playbackVolume;
+      videoRef.current.playbackRate = playbackRate;
+    }
+    syncSeparatedAudioSettings();
+  }, [hasSeparatedReviewAudio, isPlaybackMuted, isReviewGameAudioEnabled, isReviewMicAudioEnabled, playbackVolume, playbackRate, syncSeparatedAudioSettings]);
 
-  // High-performance time tracking loop using requestAnimationFrame
+  // High-performance time tracking loop + separated audio A/V drift lock
   useEffect(() => {
     if (!isPlaying) {
       if (animFrameRef.current) {
@@ -205,8 +242,17 @@ export const App: React.FC = () => {
     let lastUpdate = 0;
     const trackPlayhead = (now: number) => {
       if (videoRef.current && !videoRef.current.paused) {
+        const videoTime = videoRef.current.currentTime;
+        if (hasSeparatedReviewAudio) {
+          if (gameAudioRef.current && Math.abs(gameAudioRef.current.currentTime - videoTime) > 0.06) {
+            gameAudioRef.current.currentTime = videoTime;
+          }
+          if (micAudioRef.current && Math.abs(micAudioRef.current.currentTime - videoTime) > 0.06) {
+            micAudioRef.current.currentTime = videoTime;
+          }
+        }
         if (now - lastUpdate > 33) {
-          setCurrentTime(videoRef.current.currentTime);
+          setCurrentTime(videoTime);
           lastUpdate = now;
         }
         animFrameRef.current = requestAnimationFrame(trackPlayhead);
@@ -219,7 +265,7 @@ export const App: React.FC = () => {
         cancelAnimationFrame(animFrameRef.current);
       }
     };
-  }, [isPlaying]);
+  }, [isPlaying, hasSeparatedReviewAudio]);
 
   // Use the operating system notification center so capture feedback remains
   // visible while a game or another selected window owns the foreground.
@@ -276,8 +322,12 @@ export const App: React.FC = () => {
         setTrimRange([0, activeClip.duration]);
       }
       videoRef.current.currentTime = 0;
-      videoRef.current.muted = isPlaybackMuted;
+      videoRef.current.muted = hasSeparatedReviewAudio
+        ? true
+        : (isPlaybackMuted || !isReviewGameAudioEnabled);
       videoRef.current.volume = playbackVolume;
+      videoRef.current.playbackRate = playbackRate;
+      syncSeparatedAudioSettings();
       setCurrentTime(0);
     }
   };
@@ -286,25 +336,41 @@ export const App: React.FC = () => {
   const handlePlayPause = useCallback(() => {
     if (!videoRef.current) return;
     if (videoRef.current.paused) {
+      const currentPos = videoRef.current.currentTime;
+      syncSeparatedAudioSettings();
       videoRef.current.play().then(() => {
         setIsPlaying(true);
+        if (hasSeparatedReviewAudio) {
+          if (gameAudioRef.current) {
+            gameAudioRef.current.currentTime = currentPos;
+            void gameAudioRef.current.play().catch(() => undefined);
+          }
+          if (micAudioRef.current) {
+            micAudioRef.current.currentTime = currentPos;
+            void micAudioRef.current.play().catch(() => undefined);
+          }
+        }
       }).catch(err => {
         console.warn('Video play error:', err);
       });
     } else {
       videoRef.current.pause();
+      gameAudioRef.current?.pause();
+      micAudioRef.current?.pause();
       setIsPlaying(false);
       if (videoRef.current) {
         setCurrentTime(videoRef.current.currentTime);
       }
     }
-  }, []);
+  }, [hasSeparatedReviewAudio, syncSeparatedAudioSettings]);
 
   // Seek
   const handleSeek = useCallback((time: number) => {
     if (!videoRef.current) return;
     const clampedTime = Math.max(0, Math.min(duration, time));
     videoRef.current.currentTime = clampedTime;
+    if (gameAudioRef.current) gameAudioRef.current.currentTime = clampedTime;
+    if (micAudioRef.current) micAudioRef.current.currentTime = clampedTime;
     setCurrentTime(clampedTime);
   }, [duration]);
 
@@ -312,6 +378,8 @@ export const App: React.FC = () => {
   const handleStepFrame = useCallback((direction: 'prev' | 'next') => {
     if (!videoRef.current) return;
     videoRef.current.pause();
+    gameAudioRef.current?.pause();
+    micAudioRef.current?.pause();
     setIsPlaying(false);
 
     const frameDelta = 1 / (activeClip?.frameRate || config.fps || 60);
@@ -320,6 +388,8 @@ export const App: React.FC = () => {
       : Math.max(0, videoRef.current.currentTime - frameDelta);
 
     videoRef.current.currentTime = target;
+    if (gameAudioRef.current) gameAudioRef.current.currentTime = target;
+    if (micAudioRef.current) micAudioRef.current.currentTime = target;
     setCurrentTime(target);
   }, [duration, config.fps, activeClip?.frameRate]);
 
@@ -329,6 +399,8 @@ export const App: React.FC = () => {
     if (videoRef.current) {
       videoRef.current.playbackRate = rate;
     }
+    if (gameAudioRef.current) gameAudioRef.current.playbackRate = rate;
+    if (micAudioRef.current) micAudioRef.current.playbackRate = rate;
   }, []);
 
   const handleChangePlaybackVolume = useCallback((volume: number) => {
@@ -337,17 +409,35 @@ export const App: React.FC = () => {
     if (normalized > 0) setIsPlaybackMuted(false);
     if (videoRef.current) {
       videoRef.current.volume = normalized;
-      if (normalized > 0) videoRef.current.muted = false;
+      if (normalized > 0 && !hasSeparatedReviewAudio) {
+        videoRef.current.muted = !isReviewGameAudioEnabled;
+      }
     }
-  }, []);
+    if (gameAudioRef.current) {
+      gameAudioRef.current.volume = normalized;
+      if (normalized > 0) gameAudioRef.current.muted = !isReviewGameAudioEnabled;
+    }
+    if (micAudioRef.current) {
+      micAudioRef.current.volume = normalized;
+      if (normalized > 0) micAudioRef.current.muted = !isReviewMicAudioEnabled;
+    }
+  }, [hasSeparatedReviewAudio, isReviewGameAudioEnabled, isReviewMicAudioEnabled]);
 
   const handleTogglePlaybackMute = useCallback(() => {
     setIsPlaybackMuted(currentMuted => {
       const nextMuted = !currentMuted;
-      if (videoRef.current) videoRef.current.muted = nextMuted;
+      if (videoRef.current) {
+        videoRef.current.muted = hasSeparatedReviewAudio ? true : (nextMuted || !isReviewGameAudioEnabled);
+      }
+      if (gameAudioRef.current) {
+        gameAudioRef.current.muted = nextMuted || !isReviewGameAudioEnabled;
+      }
+      if (micAudioRef.current) {
+        micAudioRef.current.muted = nextMuted || !isReviewMicAudioEnabled;
+      }
       return nextMuted;
     });
-  }, []);
+  }, [hasSeparatedReviewAudio, isReviewGameAudioEnabled, isReviewMicAudioEnabled]);
 
   // Sync annotations to active clip
   const syncClipAnnotations = useCallback((newAnnotations: TacticalAnnotation[]) => {
@@ -397,6 +487,36 @@ export const App: React.FC = () => {
         );
         if (savedPath) {
           newClip.savedFilePath = savedPath;
+
+          // Persist separated Windows & Mic audio companion tracks into .epoch_audio/
+          if ((newClip.gameAudioBlob || newClip.micAudioBlob) && window.electronAPI?.saveClipAudioTracks) {
+            try {
+              const [gameBuf, micBuf] = await Promise.all([
+                newClip.gameAudioBlob ? newClip.gameAudioBlob.arrayBuffer() : Promise.resolve(null),
+                newClip.micAudioBlob ? newClip.micAudioBlob.arrayBuffer() : Promise.resolve(null),
+              ]);
+              const savedAudioUrls = await window.electronAPI.saveClipAudioTracks(
+                safeName,
+                {
+                  gameAudioData: gameBuf ? new Uint8Array(gameBuf) : undefined,
+                  micAudioData: micBuf ? new Uint8Array(micBuf) : undefined,
+                },
+                config.storageDirectory,
+              );
+              if (savedAudioUrls) {
+                if (savedAudioUrls.gameAudioUrl) {
+                  if (newClip.gameAudioUrl?.startsWith('blob:')) URL.revokeObjectURL(newClip.gameAudioUrl);
+                  newClip.gameAudioUrl = savedAudioUrls.gameAudioUrl;
+                }
+                if (savedAudioUrls.micAudioUrl) {
+                  if (newClip.micAudioUrl?.startsWith('blob:')) URL.revokeObjectURL(newClip.micAudioUrl);
+                  newClip.micAudioUrl = savedAudioUrls.micAudioUrl;
+                }
+              }
+            } catch (audioSaveErr) {
+              console.warn('Could not persist separated audio tracks:', audioSaveErr);
+            }
+          }
 
           // Auto-generate and cache companion thumbnail to disk
           try {
@@ -574,6 +694,10 @@ export const App: React.FC = () => {
           format: 'mp4',
           burnAnnotations: true,
           timeRange: [start, end],
+          gameAudioUrl: activeClip.gameAudioUrl,
+          micAudioUrl: activeClip.micAudioUrl,
+          includeGameAudio: isReviewGameAudioEnabled,
+          includeMicAudio: isReviewMicAudioEnabled,
         },
         (pct, status) => {
           setTrimProgress(pct);
@@ -743,8 +867,12 @@ export const App: React.FC = () => {
     const sourceChanged = newCaptureSource.sourceId !== captureSource.sourceId
       || newCaptureSource.mode !== captureSource.mode;
     const audioGraphChanged = mergedAudioConfig.micDeviceId !== previousAudioConfig.micDeviceId
-      || mergedAudioConfig.isMicMuted !== previousAudioConfig.isMicMuted
-      || mergedAudioConfig.micNoiseSuppression !== previousAudioConfig.micNoiseSuppression;
+      || (!mergedAudioConfig.isMicMuted && isBuffering && !audioMixer.hasLiveMic())
+      || mergedAudioConfig.micNoiseSuppression !== previousAudioConfig.micNoiseSuppression
+      || mergedAudioConfig.antiStaticFilter !== previousAudioConfig.antiStaticFilter
+      || mergedAudioConfig.bypassAudioFilters !== previousAudioConfig.bypassAudioFilters
+      || mergedAudioConfig.audioSampleRate !== previousAudioConfig.audioSampleRate
+      || mergedAudioConfig.audioBitrate !== previousAudioConfig.audioBitrate;
     rollingBuffer.setConfig(mergedConfig);
     setConfig(mergedConfig);
     StorageManager.saveConfig(mergedConfig);
@@ -757,6 +885,7 @@ export const App: React.FC = () => {
       });
     }
 
+    setAudioConfig(mergedAudioConfig);
     audioMixer.setConfig(mergedAudioConfig);
     StorageManager.saveAudioConfig(mergedAudioConfig);
 
@@ -781,6 +910,39 @@ export const App: React.FC = () => {
     }
 
   }, [config, captureSource, isBuffering, showNotification, refreshVaultFromDisk]);
+
+  const handleToggleGameAudioMute = useCallback(() => {
+    setAudioConfig(prev => {
+      const nextMuted = !prev.isGameAudioMuted;
+      const updated = { ...prev, isGameAudioMuted: nextMuted };
+      audioMixer.setGameAudioMuted(nextMuted);
+      StorageManager.saveAudioConfig(updated);
+      return updated;
+    });
+  }, []);
+
+  const handleToggleMicMute = useCallback(() => {
+    setAudioConfig(prev => {
+      const nextMuted = !prev.isMicMuted;
+      const updated = { ...prev, isMicMuted: nextMuted };
+      audioMixer.setMicMuted(nextMuted);
+      StorageManager.saveAudioConfig(updated);
+
+      // If mic was muted when buffer started, restart once to acquire live mic stream
+      if (isBuffering && !nextMuted && !audioMixer.hasLiveMic()) {
+        void rollingBuffer.startCapture(captureSource).then(started => {
+          setIsBuffering(started);
+          if (!started) {
+            showNotification(
+              'CAPTURE FAILED',
+              rollingBuffer.getLastError() || 'Could not enable microphone capture.',
+            );
+          }
+        });
+      }
+      return updated;
+    });
+  }, [isBuffering, captureSource, showNotification]);
 
   return (
     <div className="relative w-screen h-screen flex flex-col bg-[#070a12] text-white overflow-hidden select-none">
@@ -854,6 +1016,9 @@ export const App: React.FC = () => {
             onOpenVaultFolder={handleOpenVaultFolder}
             captureSource={captureSource}
             onSelectCaptureSource={handleSelectCaptureSource}
+            audioConfig={audioConfig}
+            onToggleGameAudioMute={handleToggleGameAudioMute}
+            onToggleMicMute={handleToggleMicMute}
           />
         )}
 
@@ -912,24 +1077,71 @@ export const App: React.FC = () => {
                     key={activeClip.id}
                     src={activeClip.videoBlobUrl}
                     onLoadedMetadata={handleLoadedMetadata}
-                    onPlay={() => setIsPlaying(true)}
-                    onPause={() => setIsPlaying(false)}
+                    onPlay={() => {
+                      setIsPlaying(true);
+                      if (hasSeparatedReviewAudio && videoRef.current) {
+                        const pos = videoRef.current.currentTime;
+                        syncSeparatedAudioSettings();
+                        if (gameAudioRef.current) {
+                          gameAudioRef.current.currentTime = pos;
+                          void gameAudioRef.current.play().catch(() => undefined);
+                        }
+                        if (micAudioRef.current) {
+                          micAudioRef.current.currentTime = pos;
+                          void micAudioRef.current.play().catch(() => undefined);
+                        }
+                      }
+                    }}
+                    onPause={() => {
+                      setIsPlaying(false);
+                      gameAudioRef.current?.pause();
+                      micAudioRef.current?.pause();
+                    }}
                     onEnded={() => {
                       setIsPlaying(false);
+                      gameAudioRef.current?.pause();
+                      micAudioRef.current?.pause();
                       setCurrentTime(videoRef.current?.duration || duration);
                     }}
-                    onSeeked={event => setCurrentTime(event.currentTarget.currentTime)}
+                    onSeeked={event => {
+                      const pos = event.currentTarget.currentTime;
+                      setCurrentTime(pos);
+                      if (gameAudioRef.current) gameAudioRef.current.currentTime = pos;
+                      if (micAudioRef.current) micAudioRef.current.currentTime = pos;
+                    }}
                     onError={event => {
                       setIsPlaying(false);
+                      gameAudioRef.current?.pause();
+                      micAudioRef.current?.pause();
                       console.error('Video playback error:', event.currentTarget.error);
                     }}
                     playsInline
-                    muted={isPlaybackMuted}
+                    muted={hasSeparatedReviewAudio ? true : (isPlaybackMuted || !isReviewGameAudioEnabled)}
                     disablePictureInPicture
                     autoPlay={false}
                     preload="auto"
                     className="w-full h-full object-contain pointer-events-none"
                   />
+
+                  {/* Synchronized separated audio track elements for review playback */}
+                  {activeClip.gameAudioUrl && (
+                    <audio
+                      ref={gameAudioRef}
+                      key={`${activeClip.id}_game`}
+                      src={activeClip.gameAudioUrl}
+                      preload="auto"
+                      muted={isPlaybackMuted || !isReviewGameAudioEnabled}
+                    />
+                  )}
+                  {activeClip.micAudioUrl && (
+                    <audio
+                      ref={micAudioRef}
+                      key={`${activeClip.id}_mic`}
+                      src={activeClip.micAudioUrl}
+                      preload="auto"
+                      muted={isPlaybackMuted || !isReviewMicAudioEnabled}
+                    />
+                  )}
 
                   {/* Tactical Vector Drawing Canvas Overlay */}
                   <TacticalCanvas
@@ -971,6 +1183,13 @@ export const App: React.FC = () => {
               isTrimmingSaving={isTrimmingSaving}
               isFullscreenPlayer={isFullscreenPlayer}
               onToggleFullscreenPlayer={() => setIsFullscreenPlayer(prev => !prev)}
+              videoSourceUrl={activeClip.videoBlobUrl}
+              gameAudioUrl={activeClip.gameAudioUrl}
+              micAudioUrl={activeClip.micAudioUrl}
+              isGameAudioEnabled={isReviewGameAudioEnabled}
+              isMicAudioEnabled={isReviewMicAudioEnabled}
+              onToggleGameAudio={() => setIsReviewGameAudioEnabled(prev => !prev)}
+              onToggleMicAudio={() => setIsReviewMicAudioEnabled(prev => !prev)}
             />
           )}
         </div>
@@ -995,6 +1214,10 @@ export const App: React.FC = () => {
         videoSourceUrl={clipToExport?.videoBlobUrl || activeClip?.videoBlobUrl || null}
         annotations={clipToExport?.annotations || annotations}
         duration={clipToExport?.duration || duration}
+        gameAudioUrl={clipToExport ? clipToExport.gameAudioUrl : activeClip?.gameAudioUrl}
+        micAudioUrl={clipToExport ? clipToExport.micAudioUrl : activeClip?.micAudioUrl}
+        includeGameAudio={clipToExport && clipToExport.id !== activeClip?.id ? true : isReviewGameAudioEnabled}
+        includeMicAudio={clipToExport && clipToExport.id !== activeClip?.id ? true : isReviewMicAudioEnabled}
       />
 
       {/* View-Blocking Trim Processing Modal */}

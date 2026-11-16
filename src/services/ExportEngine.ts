@@ -35,20 +35,81 @@ export class ExportEngine {
 
     onProgress(10, 'Checking audio tracks and configuring encoder...');
     
-    // Try to decode audio from source video
+    // Try to decode audio from separated tracks (if available) or source video
     let audioBuffer: AudioBuffer | null = null;
     let audioSampleRate = 48_000;
     let audioChannels = 2;
     let hasAudio = false;
 
+    const hasSeparatedTracks = Boolean(options.gameAudioUrl || options.micAudioUrl);
+    const includeGame = options.includeGameAudio !== false;
+    const includeMic = options.includeMicAudio !== false;
+
     try {
-      const resp = await fetch(videoSourceUrl);
-      const arrayBuf = await resp.arrayBuffer();
       const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
-      if (AudioCtxClass && arrayBuf.byteLength > 0) {
+      if (AudioCtxClass) {
         const audioCtx = new AudioCtxClass();
         try {
-          audioBuffer = await audioCtx.decodeAudioData(arrayBuf);
+          const decodeUrl = async (url: string): Promise<AudioBuffer | null> => {
+            try {
+              const resp = await fetch(url);
+              const arrayBuf = await resp.arrayBuffer();
+              if (arrayBuf.byteLength === 0) return null;
+              const decoded = await audioCtx.decodeAudioData(arrayBuf);
+              return decoded && decoded.numberOfChannels > 0 && decoded.duration > 0 ? decoded : null;
+            } catch {
+              return null;
+            }
+          };
+
+          if (hasSeparatedTracks) {
+            const buffers: AudioBuffer[] = [];
+            if (includeGame && options.gameAudioUrl) {
+              const gameBuf = await decodeUrl(options.gameAudioUrl);
+              if (gameBuf) buffers.push(gameBuf);
+            }
+            if (includeMic && options.micAudioUrl) {
+              const micBuf = await decodeUrl(options.micAudioUrl);
+              if (micBuf) buffers.push(micBuf);
+            }
+            if (buffers.length === 1) {
+              audioBuffer = buffers[0];
+            } else if (buffers.length === 2) {
+              const [b1, b2] = buffers;
+              const targetRate = b1.sampleRate;
+              const outChannels = Math.min(2, Math.max(b1.numberOfChannels, b2.numberOfChannels));
+              const b2LengthAtRate = Math.round((b2.length * targetRate) / b2.sampleRate);
+              const outLength = Math.max(b1.length, b2LengthAtRate);
+              const mixed = audioCtx.createBuffer(outChannels, outLength, targetRate);
+              const ratio2 = b2.sampleRate / targetRate;
+              for (let ch = 0; ch < outChannels; ch++) {
+                const dst = mixed.getChannelData(ch);
+                const src1 = b1.getChannelData(Math.min(ch, b1.numberOfChannels - 1));
+                const src2 = b2.getChannelData(Math.min(ch, b2.numberOfChannels - 1));
+                for (let i = 0; i < outLength; i++) {
+                  const s1 = i < src1.length ? src1[i] : 0;
+                  let s2 = 0;
+                  if (b2.sampleRate === targetRate) {
+                    s2 = i < src2.length ? src2[i] : 0;
+                  } else {
+                    const pos = i * ratio2;
+                    const idx0 = Math.floor(pos);
+                    if (idx0 < src2.length) {
+                      const idx1 = Math.min(src2.length - 1, idx0 + 1);
+                      const frac = pos - idx0;
+                      s2 = src2[idx0] * (1 - frac) + src2[idx1] * frac;
+                    }
+                  }
+                  const sum = s1 + s2;
+                  dst[i] = sum > 1 ? 1 : sum < -1 ? -1 : sum;
+                }
+              }
+              audioBuffer = mixed;
+            }
+          } else if (includeGame || includeMic) {
+            audioBuffer = await decodeUrl(videoSourceUrl);
+          }
+
           if (audioBuffer && audioBuffer.numberOfChannels > 0 && audioBuffer.duration > 0) {
             hasAudio = true;
             audioSampleRate = audioBuffer.sampleRate;
@@ -141,28 +202,57 @@ export class ExportEngine {
         });
         audioEncoder.configure(chosenAudioConfig);
 
-          const startSample = Math.floor(startTime * audioSampleRate);
-          const endSample = Math.min(audioBuffer.length, Math.floor(endTime * audioSampleRate));
-          const frameSize = 1024;
-          for (let offset = startSample; offset < endSample; offset += frameSize) {
-            const currentChunkFrames = Math.min(frameSize, endSample - offset);
-            const planarData = new Float32Array(currentChunkFrames * audioChannels);
+        const sourceSampleRate = audioBuffer.sampleRate;
+        const startSample = Math.floor(startTime * sourceSampleRate);
+        const endSample = Math.min(audioBuffer.length, Math.floor(endTime * sourceSampleRate));
+        const frameSize = 1024;
+        for (let offset = startSample; offset < endSample; offset += frameSize) {
+          const srcChunkFrames = Math.min(frameSize, endSample - offset);
+          const timestamp = Math.max(0, Math.round(((offset - startSample) / sourceSampleRate) * 1_000_000));
+
+          if (sourceSampleRate === audioSampleRate) {
+            const planarData = new Float32Array(srcChunkFrames * audioChannels);
             for (let ch = 0; ch < audioChannels; ch++) {
-              const channelData = audioBuffer.getChannelData(ch);
-              planarData.set(channelData.subarray(offset, offset + currentChunkFrames), ch * currentChunkFrames);
+              const channelData = audioBuffer.getChannelData(Math.min(ch, audioBuffer.numberOfChannels - 1));
+              planarData.set(channelData.subarray(offset, offset + srcChunkFrames), ch * srcChunkFrames);
             }
-            const timestamp = Math.max(0, Math.round(((offset - startSample) / audioSampleRate) * 1_000_000));
             const audioData = new AudioData({
               format: 'f32-planar',
               sampleRate: audioSampleRate,
               numberOfChannels: audioChannels,
-              numberOfFrames: currentChunkFrames,
+              numberOfFrames: srcChunkFrames,
+              timestamp,
+              data: planarData,
+            });
+            audioEncoder.encode(audioData);
+            audioData.close();
+          } else {
+            const outFrames = Math.max(1, Math.round((srcChunkFrames * audioSampleRate) / sourceSampleRate));
+            const ratio = srcChunkFrames / outFrames;
+            const planarData = new Float32Array(outFrames * audioChannels);
+            for (let ch = 0; ch < audioChannels; ch++) {
+              const channelData = audioBuffer.getChannelData(Math.min(ch, audioBuffer.numberOfChannels - 1));
+              const dstOffset = ch * outFrames;
+              for (let i = 0; i < outFrames; i++) {
+                const srcPos = offset + i * ratio;
+                const idx0 = Math.min(endSample - 1, Math.floor(srcPos));
+                const idx1 = Math.min(endSample - 1, idx0 + 1);
+                const frac = srcPos - Math.floor(srcPos);
+                planarData[dstOffset + i] = channelData[idx0] * (1 - frac) + channelData[idx1] * frac;
+              }
+            }
+            const audioData = new AudioData({
+              format: 'f32-planar',
+              sampleRate: audioSampleRate,
+              numberOfChannels: audioChannels,
+              numberOfFrames: outFrames,
               timestamp,
               data: planarData,
             });
             audioEncoder.encode(audioData);
             audioData.close();
           }
+        }
         await audioEncoder.flush();
         audioEncoder.close();
       } catch (audioEncErr) {

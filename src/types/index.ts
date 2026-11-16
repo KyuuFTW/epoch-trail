@@ -81,6 +81,10 @@ export interface SessionClip {
   droppedFrames?: number;
   annotations: TacticalAnnotation[];
   savedFilePath?: string;
+  gameAudioUrl?: string;
+  micAudioUrl?: string;
+  gameAudioBlob?: Blob;
+  micAudioBlob?: Blob;
 }
 
 export interface DiskClipFile {
@@ -95,6 +99,8 @@ export interface DiskClipFile {
   mimeType: string;
   mediaUrl: string;
   thumbnailUrl?: string;
+  gameAudioUrl?: string;
+  micAudioUrl?: string;
   data?: Uint8Array;
   format: 'mp4' | 'webm';
 }
@@ -107,6 +113,10 @@ export interface ExportOptions {
   format: 'mp4' | 'webm';
   burnAnnotations: boolean;
   timeRange?: [number, number];
+  gameAudioUrl?: string;
+  micAudioUrl?: string;
+  includeGameAudio?: boolean;
+  includeMicAudio?: boolean;
 }
 
 export interface DesktopSource {
@@ -137,6 +147,11 @@ export interface ElectronBridge {
   saveExportedVideo: (data: Uint8Array, defaultName: string) => Promise<string | null>;
   saveClipToVaultFolder: (data: Uint8Array, fileName: string, targetDir?: string) => Promise<string | null>;
   saveClipThumbnail: (fileName: string, base64Data: string, targetDir?: string) => Promise<string | null>;
+  saveClipAudioTracks?: (
+    fileName: string,
+    tracks: { gameAudioData?: Uint8Array; micAudioData?: Uint8Array },
+    targetDir?: string,
+  ) => Promise<{ gameAudioUrl?: string; micAudioUrl?: string } | null>;
   listVaultFiles: (targetDir?: string) => Promise<DiskClipFile[]>;
   deleteVaultFile: (filePath: string) => Promise<boolean>;
   renameVaultFile: (oldFilePath: string, newNameWithoutExt: string) => Promise<string | null>;

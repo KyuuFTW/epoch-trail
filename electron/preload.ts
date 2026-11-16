@@ -57,6 +57,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
   saveClipThumbnail: async (fileName: string, base64Data: string, targetDir?: string) => {
     return await ipcRenderer.invoke('save-clip-thumbnail', fileName, base64Data, targetDir);
   },
+  saveClipAudioTracks: async (
+    fileName: string,
+    tracks: { gameAudioData?: Uint8Array; micAudioData?: Uint8Array },
+    targetDir?: string,
+  ) => {
+    return await ipcRenderer.invoke('save-clip-audio-tracks', fileName, tracks, targetDir);
+  },
   listVaultFiles: async (targetDir?: string) => {
     return await ipcRenderer.invoke('list-vault-files', targetDir);
   },

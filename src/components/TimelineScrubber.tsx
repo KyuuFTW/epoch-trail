@@ -15,9 +15,76 @@ import {
   Bookmark,
   Check,
   Maximize2,
-  Minimize2
+  Minimize2,
+  Mic,
+  MicOff,
+  Film
 } from 'lucide-react';
 import { TacticalAnnotation } from '../types';
+
+function useAudioWaveformPeaks(audioUrl?: string, bins = 96): number[] {
+  const [peaks, setPeaks] = useState<number[]>([]);
+
+  useEffect(() => {
+    if (!audioUrl) {
+      setPeaks([]);
+      return;
+    }
+
+    let cancelled = false;
+    const controller = new AbortController();
+
+    const loadPeaks = async () => {
+      try {
+        const resp = await fetch(audioUrl, { signal: controller.signal });
+        const arrayBuf = await resp.arrayBuffer();
+        if (cancelled || arrayBuf.byteLength === 0) return;
+
+        const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
+        if (!AudioCtxClass) return;
+
+        const ctx = new AudioCtxClass();
+        try {
+          const decoded = await ctx.decodeAudioData(arrayBuf);
+          if (cancelled || decoded.length === 0) return;
+
+          const ch0 = decoded.getChannelData(0);
+          const ch1 = decoded.numberOfChannels > 1 ? decoded.getChannelData(1) : null;
+          const step = Math.max(1, Math.floor(ch0.length / bins));
+          const computed: number[] = [];
+
+          for (let b = 0; b < bins; b++) {
+            const start = b * step;
+            const end = Math.min(ch0.length, start + step);
+            let maxPeak = 0;
+            const stride = Math.max(1, Math.floor((end - start) / 64));
+            for (let i = start; i < end; i += stride) {
+              const v0 = Math.abs(ch0[i]);
+              const v1 = ch1 ? Math.abs(ch1[i]) : 0;
+              const v = v0 > v1 ? v0 : v1;
+              if (v > maxPeak) maxPeak = v;
+            }
+            computed.push(Math.min(1, Math.max(0.08, Math.pow(maxPeak, 0.7))));
+          }
+          if (!cancelled) setPeaks(computed);
+        } finally {
+          try { await ctx.close(); } catch {}
+        }
+      } catch {
+        if (!cancelled) setPeaks([]);
+      }
+    };
+
+    void loadPeaks();
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [audioUrl, bins]);
+
+  return peaks;
+}
 
 interface TimelineScrubberProps {
   currentTime: number;
@@ -40,6 +107,13 @@ interface TimelineScrubberProps {
   isTrimmingSaving?: boolean;
   isFullscreenPlayer?: boolean;
   onToggleFullscreenPlayer?: () => void;
+  videoSourceUrl?: string;
+  gameAudioUrl?: string;
+  micAudioUrl?: string;
+  isGameAudioEnabled?: boolean;
+  isMicAudioEnabled?: boolean;
+  onToggleGameAudio?: () => void;
+  onToggleMicAudio?: () => void;
 }
 
 export const TimelineScrubber: React.FC<TimelineScrubberProps> = React.memo(({
@@ -63,9 +137,21 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = React.memo(({
   isTrimmingSaving = false,
   isFullscreenPlayer,
   onToggleFullscreenPlayer,
+  videoSourceUrl,
+  gameAudioUrl,
+  micAudioUrl,
+  isGameAudioEnabled = true,
+  isMicAudioEnabled = true,
+  onToggleGameAudio,
+  onToggleMicAudio,
 }) => {
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const [draggingHandle, setDraggingHandle] = useState<'in' | 'out' | null>(null);
+
+  const hasSeparatedTracks = Boolean(gameAudioUrl || micAudioUrl);
+  const gamePeaks = useAudioWaveformPeaks(gameAudioUrl);
+  const micPeaks = useAudioWaveformPeaks(micAudioUrl);
+  const legacyPeaks = useAudioWaveformPeaks(!hasSeparatedTracks ? videoSourceUrl : undefined);
 
   const formatTime = (seconds: number) => {
     if (isNaN(seconds) || seconds < 0) seconds = 0;
@@ -157,123 +243,302 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = React.memo(({
 
   return (
     <div className="w-full bg-[#080d16]/98 backdrop-blur-xl border-t border-white/10 px-4 py-3 flex flex-col gap-2.5 shadow-2xl select-none z-20 font-mono">
-      {/* 1. Timeline Track with Vertical Playhead Needle and Trim Region */}
-      <div className="space-y-1">
-        <div
-          ref={timelineRef}
-          onClick={handleTimelineClick}
-          className="relative w-full h-8 bg-black/60 rounded-xl overflow-hidden cursor-pointer border border-white/10 flex items-center group shadow-inner"
-        >
-          {/* Background Grid Lines for Frame Increments */}
-          <div className="absolute inset-0 flex justify-between pointer-events-none opacity-15">
-            {Array.from({ length: 20 }).map((_, i) => (
-              <div key={i} className="w-[1px] h-full bg-white" />
-            ))}
+      {/* 1. Timeline Track + Separated Audio Track Layers */}
+      <div className="space-y-1.5">
+        {/* Video Slider Row */}
+        <div className="flex items-center gap-2">
+          <div className="w-40 shrink-0 h-8 px-2.5 rounded-lg bg-black/50 border border-white/10 flex items-center gap-1.5 text-[10px] font-bold text-gray-300">
+            <Film className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+            <span className="truncate">VIDEO TRACK</span>
           </div>
 
-          {/* Dimmed Non-Trimmed Left Area */}
-          {inPercent > 0 && (
-            <div
-              className="absolute top-0 bottom-0 left-0 bg-black/60 z-0 border-r border-dashed border-emerald-500/40"
-              style={{ width: `${inPercent}%` }}
-            />
-          )}
-
-          {/* Active Trimmed Region Highlight */}
           <div
-            className="absolute top-0 bottom-0 bg-cyan-950/40 border-y border-cyan-400/50 z-0 shadow-lg shadow-cyan-500/10 transition-all duration-75"
-            style={{
-              left: `${inPercent}%`,
-              width: `${activeSpanPercent}%`,
-            }}
+            ref={timelineRef}
+            onClick={handleTimelineClick}
+            className="relative flex-1 h-8 bg-black/60 rounded-xl overflow-hidden cursor-pointer border border-white/10 flex items-center group shadow-inner"
           >
-            <div className="w-full h-full bg-gradient-to-r from-cyan-500/15 via-blue-500/20 to-cyan-500/15" />
-          </div>
+            {/* Background Grid Lines for Frame Increments */}
+            <div className="absolute inset-0 flex justify-between pointer-events-none opacity-15">
+              {Array.from({ length: 20 }).map((_, i) => (
+                <div key={i} className="w-[1px] h-full bg-white" />
+              ))}
+            </div>
 
-          {/* Dimmed Non-Trimmed Right Area */}
-          {outPercent < 100 && (
-            <div
-              className="absolute top-0 bottom-0 right-0 bg-black/60 z-0 border-l border-dashed border-red-500/40"
-              style={{ width: `${100 - outPercent}%` }}
-            />
-          )}
-
-          {/* Played Progress Bar within Trimmed Region */}
-          <div
-            className="absolute top-0 bottom-0 left-0 bg-gradient-to-r from-blue-600/40 to-cyan-500/40 pointer-events-none z-0"
-            style={{ width: `${progressPercent}%` }}
-          />
-
-          {/* Annotation Markers / Pips */}
-          {annotations.map(ann => {
-            const markerPercent = duration > 0 ? (ann.timestamp / duration) * 100 : 0;
-            return (
-              <button
-                key={ann.id}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onSeek(ann.timestamp);
-                  if (onSelectAnnotation) onSelectAnnotation(ann);
-                }}
-                title={`Jump to sketch at ${formatTimePrecise(ann.timestamp)} (${ann.tool})`}
-                className="absolute top-1/2 -translate-y-1/2 -ml-1 w-2.5 h-4 rounded-sm border border-white shadow-md transition-transform hover:scale-125 z-10"
-                style={{
-                  left: `${markerPercent}%`,
-                  backgroundColor: ann.color,
-                }}
+            {/* Dimmed Non-Trimmed Left Area */}
+            {inPercent > 0 && (
+              <div
+                className="absolute top-0 bottom-0 left-0 bg-black/60 z-0 border-r border-dashed border-emerald-500/40"
+                style={{ width: `${inPercent}%` }}
               />
-            );
-          })}
+            )}
 
-          {/* Draggable In-Point [ Bracket Handle */}
-          <div
-            onMouseDown={(e) => {
-              e.stopPropagation();
-              setDraggingHandle('in');
-            }}
-            title={`Trim Start [In]: ${formatTimePrecise(trimStart)} (Drag or press 'I')`}
-            className="absolute top-0 bottom-0 -ml-2 w-4 z-20 flex items-center justify-start cursor-ew-resize group/in"
-            style={{ left: `${inPercent}%` }}
-          >
-            <div className="w-3 h-full bg-emerald-500 rounded-l-md flex flex-col items-center justify-center border-l-2 border-y-2 border-emerald-300 shadow-lg shadow-emerald-500/30 group-hover/in:scale-105 transition-transform">
-              <span className="text-[9px] font-black text-black leading-none">[</span>
+            {/* Active Trimmed Region Highlight */}
+            <div
+              className="absolute top-0 bottom-0 bg-cyan-950/40 border-y border-cyan-400/50 z-0 shadow-lg shadow-cyan-500/10 transition-all duration-75"
+              style={{
+                left: `${inPercent}%`,
+                width: `${activeSpanPercent}%`,
+              }}
+            >
+              <div className="w-full h-full bg-gradient-to-r from-cyan-500/15 via-blue-500/20 to-cyan-500/15" />
             </div>
-            {/* Hover Tooltip */}
-            <div className="absolute -top-7 left-0 -translate-x-1/2 px-1.5 py-0.5 rounded bg-emerald-950 border border-emerald-500 text-emerald-300 text-[10px] font-bold opacity-0 group-hover/in:opacity-100 transition-opacity pointer-events-none shadow-xl whitespace-nowrap">
-              In: {formatTimePrecise(trimStart)}
-            </div>
-          </div>
 
-          {/* Draggable Out-Point ] Bracket Handle */}
-          <div
-            onMouseDown={(e) => {
-              e.stopPropagation();
-              setDraggingHandle('out');
-            }}
-            title={`Trim End [Out]: ${formatTimePrecise(trimEnd)} (Drag or press 'O')`}
-            className="absolute top-0 bottom-0 -ml-2 w-4 z-20 flex items-center justify-end cursor-ew-resize group/out"
-            style={{ left: `${outPercent}%` }}
-          >
-            <div className="w-3 h-full bg-red-500 rounded-r-md flex flex-col items-center justify-center border-r-2 border-y-2 border-red-300 shadow-lg shadow-red-500/30 group-hover/out:scale-105 transition-transform">
-              <span className="text-[9px] font-black text-black leading-none">]</span>
-            </div>
-            {/* Hover Tooltip */}
-            <div className="absolute -top-7 right-0 translate-x-1/2 px-1.5 py-0.5 rounded bg-red-950 border border-red-500 text-red-300 text-[10px] font-bold opacity-0 group-hover/out:opacity-100 transition-opacity pointer-events-none shadow-xl whitespace-nowrap">
-              Out: {formatTimePrecise(trimEnd)}
-            </div>
-          </div>
+            {/* Dimmed Non-Trimmed Right Area */}
+            {outPercent < 100 && (
+              <div
+                className="absolute top-0 bottom-0 right-0 bg-black/60 z-0 border-l border-dashed border-red-500/40"
+                style={{ width: `${100 - outPercent}%` }}
+              />
+            )}
 
-          {/* Vertical Needle Playhead (NO CIRCLE POINTER) */}
-          <div
-            className="absolute top-0 bottom-0 pointer-events-none z-30 flex flex-col items-center"
-            style={{ left: `${progressPercent}%`, transform: 'translateX(-50%)' }}
-          >
-            {/* Sharp Downward Needle Head */}
-            <div className="w-3.5 h-2.5 bg-cyan-300 [clip-path:polygon(0%_0%,100%_0%,50%_100%)] shadow-md shadow-cyan-400/80 shrink-0" />
-            {/* Full-Height Vertical Needle Bar */}
-            <div className="w-[2px] flex-1 bg-cyan-300 shadow-[0_0_10px_#22d3ee]" />
+            {/* Played Progress Bar within Trimmed Region */}
+            <div
+              className="absolute top-0 bottom-0 left-0 bg-gradient-to-r from-blue-600/40 to-cyan-500/40 pointer-events-none z-0"
+              style={{ width: `${progressPercent}%` }}
+            />
+
+            {/* Annotation Markers / Pips */}
+            {annotations.map(ann => {
+              const markerPercent = duration > 0 ? (ann.timestamp / duration) * 100 : 0;
+              return (
+                <button
+                  key={ann.id}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onSeek(ann.timestamp);
+                    if (onSelectAnnotation) onSelectAnnotation(ann);
+                  }}
+                  title={`Jump to sketch at ${formatTimePrecise(ann.timestamp)} (${ann.tool})`}
+                  className="absolute top-1/2 -translate-y-1/2 -ml-1 w-2.5 h-4 rounded-sm border border-white shadow-md transition-transform hover:scale-125 z-10"
+                  style={{
+                    left: `${markerPercent}%`,
+                    backgroundColor: ann.color,
+                  }}
+                />
+              );
+            })}
+
+            {/* Draggable In-Point [ Bracket Handle */}
+            <div
+              onMouseDown={(e) => {
+                e.stopPropagation();
+                setDraggingHandle('in');
+              }}
+              title={`Trim Start [In]: ${formatTimePrecise(trimStart)} (Drag or press 'I')`}
+              className="absolute top-0 bottom-0 -ml-2 w-4 z-20 flex items-center justify-start cursor-ew-resize group/in"
+              style={{ left: `${inPercent}%` }}
+            >
+              <div className="w-3 h-full bg-emerald-500 rounded-l-md flex flex-col items-center justify-center border-l-2 border-y-2 border-emerald-300 shadow-lg shadow-emerald-500/30 group-hover/in:scale-105 transition-transform">
+                <span className="text-[9px] font-black text-black leading-none">[</span>
+              </div>
+              {/* Hover Tooltip */}
+              <div className="absolute -top-7 left-0 -translate-x-1/2 px-1.5 py-0.5 rounded bg-emerald-950 border border-emerald-500 text-emerald-300 text-[10px] font-bold opacity-0 group-hover/in:opacity-100 transition-opacity pointer-events-none shadow-xl whitespace-nowrap">
+                In: {formatTimePrecise(trimStart)}
+              </div>
+            </div>
+
+            {/* Draggable Out-Point ] Bracket Handle */}
+            <div
+              onMouseDown={(e) => {
+                e.stopPropagation();
+                setDraggingHandle('out');
+              }}
+              title={`Trim End [Out]: ${formatTimePrecise(trimEnd)} (Drag or press 'O')`}
+              className="absolute top-0 bottom-0 -ml-2 w-4 z-20 flex items-center justify-end cursor-ew-resize group/out"
+              style={{ left: `${outPercent}%` }}
+            >
+              <div className="w-3 h-full bg-red-500 rounded-r-md flex flex-col items-center justify-center border-r-2 border-y-2 border-red-300 shadow-lg shadow-red-500/30 group-hover/out:scale-105 transition-transform">
+                <span className="text-[9px] font-black text-black leading-none">]</span>
+              </div>
+              {/* Hover Tooltip */}
+              <div className="absolute -top-7 right-0 translate-x-1/2 px-1.5 py-0.5 rounded bg-red-950 border border-red-500 text-red-300 text-[10px] font-bold opacity-0 group-hover/out:opacity-100 transition-opacity pointer-events-none shadow-xl whitespace-nowrap">
+                Out: {formatTimePrecise(trimEnd)}
+              </div>
+            </div>
+
+            {/* Vertical Needle Playhead (NO CIRCLE POINTER) */}
+            <div
+              className="absolute top-0 bottom-0 pointer-events-none z-30 flex flex-col items-center"
+              style={{ left: `${progressPercent}%`, transform: 'translateX(-50%)' }}
+            >
+              {/* Sharp Downward Needle Head */}
+              <div className="w-3.5 h-2.5 bg-cyan-300 [clip-path:polygon(0%_0%,100%_0%,50%_100%)] shadow-md shadow-cyan-400/80 shrink-0" />
+              {/* Full-Height Vertical Needle Bar */}
+              <div className="w-[2px] flex-1 bg-cyan-300 shadow-[0_0_10px_#22d3ee]" />
+            </div>
           </div>
         </div>
+
+        {/* Audio Track Layers Beneath the Video Player Slider (Enable / Disable only) */}
+        {hasSeparatedTracks ? (
+          <div className="space-y-1">
+            {[
+              {
+                id: 'windows',
+                label: 'WINDOWS AUDIO',
+                hasAudio: Boolean(gameAudioUrl),
+                enabled: isGameAudioEnabled,
+                onToggle: onToggleGameAudio,
+                peaks: gamePeaks,
+                accent: 'cyan' as const,
+              },
+              {
+                id: 'mic',
+                label: 'MIC AUDIO',
+                hasAudio: Boolean(micAudioUrl),
+                enabled: isMicAudioEnabled,
+                onToggle: onToggleMicAudio,
+                peaks: micPeaks,
+                accent: 'emerald' as const,
+              },
+            ].map(track => {
+              const active = track.hasAudio && track.enabled;
+              const barColor = !track.hasAudio
+                ? 'bg-gray-800/50'
+                : !track.enabled
+                ? 'bg-gray-700/40'
+                : track.accent === 'cyan'
+                ? 'bg-cyan-400/75'
+                : 'bg-emerald-400/75';
+
+              return (
+                <div key={track.id} className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={!track.hasAudio}
+                    onClick={track.onToggle}
+                    title={
+                      !track.hasAudio
+                        ? `${track.label} not recorded in this clip`
+                        : track.enabled
+                        ? `Disable ${track.label}`
+                        : `Enable ${track.label}`
+                    }
+                    className={`w-40 shrink-0 h-7 px-2.5 rounded-lg border flex items-center justify-between gap-1.5 text-[10px] font-bold transition-colors ${
+                      !track.hasAudio
+                        ? 'bg-black/40 border-white/5 text-gray-600 cursor-not-allowed'
+                        : track.enabled
+                        ? track.accent === 'cyan'
+                          ? 'bg-cyan-950/60 border-cyan-500/40 text-cyan-200 hover:bg-cyan-900/70'
+                          : 'bg-emerald-950/60 border-emerald-500/40 text-emerald-200 hover:bg-emerald-900/70'
+                        : 'bg-black/50 border-white/10 text-gray-500 hover:text-gray-300'
+                    }`}
+                  >
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      {track.id === 'windows' ? (
+                        active ? <Volume2 className="w-3 h-3 text-cyan-400 shrink-0" /> : <VolumeX className="w-3 h-3 shrink-0" />
+                      ) : (
+                        active ? <Mic className="w-3 h-3 text-emerald-400 shrink-0" /> : <MicOff className="w-3 h-3 shrink-0" />
+                      )}
+                      <span className="truncate">{track.label}</span>
+                    </div>
+                    <span className={`text-[8px] px-1 py-0.5 rounded shrink-0 ${
+                      !track.hasAudio
+                        ? 'bg-white/5 text-gray-600'
+                        : track.enabled
+                        ? track.accent === 'cyan'
+                          ? 'bg-cyan-500/20 text-cyan-300'
+                          : 'bg-emerald-500/20 text-emerald-300'
+                        : 'bg-red-500/15 text-red-400'
+                    }`}>
+                      {!track.hasAudio ? 'NONE' : track.enabled ? 'ON' : 'OFF'}
+                    </span>
+                  </button>
+
+                  <div
+                    onClick={handleTimelineClick}
+                    className={`relative flex-1 h-7 rounded-lg overflow-hidden cursor-pointer border flex items-center px-0.5 ${
+                      active
+                        ? 'bg-black/55 border-white/10'
+                        : 'bg-black/35 border-white/5 opacity-55'
+                    }`}
+                  >
+                    {/* Active Trimmed Region Highlight */}
+                    <div
+                      className="absolute top-0 bottom-0 bg-white/[0.03] pointer-events-none"
+                      style={{ left: `${inPercent}%`, width: `${activeSpanPercent}%` }}
+                    />
+
+                    {/* Waveform Bars */}
+                    <div className="relative z-10 w-full h-full flex items-center justify-between gap-[1px] pointer-events-none">
+                      {track.hasAudio ? (
+                        (track.peaks.length > 0 ? track.peaks : Array.from({ length: 64 }, () => 0.14)).map((peak, idx) => (
+                          <div
+                            key={idx}
+                            className={`flex-1 rounded-full transition-colors ${barColor}`}
+                            style={{ height: `${Math.round(peak * 82)}%` }}
+                          />
+                        ))
+                      ) : (
+                        <div className="w-full h-[1px] bg-white/10" />
+                      )}
+                    </div>
+
+                    {/* Playhead Line */}
+                    <div
+                      className="absolute top-0 bottom-0 w-[1.5px] bg-cyan-300/80 pointer-events-none z-20"
+                      style={{ left: `${progressPercent}%`, transform: 'translateX(-50%)' }}
+                    />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={onToggleGameAudio}
+              title={isGameAudioEnabled ? 'Disable Clip Audio' : 'Enable Clip Audio'}
+              className={`w-40 shrink-0 h-7 px-2.5 rounded-lg border flex items-center justify-between gap-1.5 text-[10px] font-bold transition-colors ${
+                isGameAudioEnabled
+                  ? 'bg-cyan-950/60 border-cyan-500/40 text-cyan-200 hover:bg-cyan-900/70'
+                  : 'bg-black/50 border-white/10 text-gray-500 hover:text-gray-300'
+              }`}
+            >
+              <div className="flex items-center gap-1.5 min-w-0">
+                {isGameAudioEnabled ? (
+                  <Volume2 className="w-3 h-3 text-cyan-400 shrink-0" />
+                ) : (
+                  <VolumeX className="w-3 h-3 shrink-0" />
+                )}
+                <span className="truncate">CLIP AUDIO</span>
+              </div>
+              <span className={`text-[8px] px-1 py-0.5 rounded shrink-0 ${
+                isGameAudioEnabled ? 'bg-cyan-500/20 text-cyan-300' : 'bg-red-500/15 text-red-400'
+              }`}>
+                {isGameAudioEnabled ? 'ON' : 'OFF'}
+              </span>
+            </button>
+
+            <div
+              onClick={handleTimelineClick}
+              className={`relative flex-1 h-7 rounded-lg overflow-hidden cursor-pointer border flex items-center px-0.5 ${
+                isGameAudioEnabled
+                  ? 'bg-black/55 border-white/10'
+                  : 'bg-black/35 border-white/5 opacity-55'
+              }`}
+            >
+              <div
+                className="relative z-10 w-full h-full flex items-center justify-between gap-[1px] pointer-events-none"
+              >
+                {(legacyPeaks.length > 0 ? legacyPeaks : Array.from({ length: 64 }, () => 0.14)).map((peak, idx) => (
+                  <div
+                    key={idx}
+                    className={`flex-1 rounded-full transition-colors ${
+                      isGameAudioEnabled ? 'bg-cyan-400/75' : 'bg-gray-700/40'
+                    }`}
+                    style={{ height: `${Math.round(peak * 82)}%` }}
+                  />
+                ))}
+              </div>
+              <div
+                className="absolute top-0 bottom-0 w-[1.5px] bg-cyan-300/80 pointer-events-none z-20"
+                style={{ left: `${progressPercent}%`, transform: 'translateX(-50%)' }}
+              />
+            </div>
+          </div>
+        )}
 
         {/* Trim Range Timecodes Bar */}
         <div className="flex items-center justify-between text-[11px] text-gray-400 font-mono px-1">

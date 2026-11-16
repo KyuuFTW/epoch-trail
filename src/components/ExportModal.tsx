@@ -10,6 +10,10 @@ interface ExportModalProps {
   videoSourceUrl: string | null;
   annotations: TacticalAnnotation[];
   duration: number;
+  gameAudioUrl?: string;
+  micAudioUrl?: string;
+  includeGameAudio?: boolean;
+  includeMicAudio?: boolean;
 }
 
 export const ExportModal: React.FC<ExportModalProps> = ({
@@ -18,6 +22,10 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   videoSourceUrl,
   annotations,
   duration,
+  gameAudioUrl,
+  micAudioUrl,
+  includeGameAudio = true,
+  includeMicAudio = true,
 }) => {
   const [fileName, setFileName] = useState(`epoch_tactical_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '_')}`);
   const [burnAnnotations, setBurnAnnotations] = useState(true);
@@ -49,6 +57,10 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         format: 'mp4',
         burnAnnotations,
         timeRange: [0, duration || 60],
+        gameAudioUrl,
+        micAudioUrl,
+        includeGameAudio,
+        includeMicAudio,
       };
 
       const resultBlob = await ExportEngine.exportFlattenedVideo(

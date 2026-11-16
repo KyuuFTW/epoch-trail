@@ -1,5 +1,5 @@
 import { ArrayBufferTarget, Muxer } from 'mp4-muxer';
-import { audioMixer } from './AudioMixer';
+import { audioMixer, SeparatedAudioTracks } from './AudioMixer';
 
 interface StoredVideoChunk {
   type: EncodedVideoChunkType;
@@ -26,11 +26,47 @@ type TrackProcessorConstructor = new <T>(options: {
 
 export interface Mp4Snapshot {
   blob: Blob;
+  gameAudioBlob?: Blob;
+  micAudioBlob?: Blob;
   durationSeconds: number;
   frameRate: number;
   width: number;
   height: number;
   droppedFrames: number;
+}
+
+interface SeparatedTrackRing {
+  kind: 'game' | 'mic';
+  reader: ReadableStreamDefaultReader<AudioData> | null;
+  readTask: Promise<void> | null;
+  encoder: AudioEncoder | null;
+  chunks: StoredAudioChunk[];
+  decoderConfig: AudioDecoderConfig | null;
+  codec: 'aac' | 'opus';
+  sampleRate: number;
+  channels: number;
+  inputOriginUs: number | null;
+  baseOffsetUs: number;
+  lastChunkTimestamp: number | null;
+  lastChunkDuration: number;
+}
+
+function createSeparatedTrackRing(kind: 'game' | 'mic'): SeparatedTrackRing {
+  return {
+    kind,
+    reader: null,
+    readTask: null,
+    encoder: null,
+    chunks: [],
+    decoderConfig: null,
+    codec: 'aac',
+    sampleRate: 48_000,
+    channels: 2,
+    inputOriginUs: null,
+    baseOffsetUs: 0,
+    lastChunkTimestamp: null,
+    lastChunkDuration: 0,
+  };
 }
 
 function copyChunk(chunk: EncodedVideoChunk | EncodedAudioChunk): Uint8Array {
@@ -48,9 +84,6 @@ function copyDescription(description?: AllowSharedBufferSource): ArrayBuffer | u
 }
 
 function containsH264IdrFrame(data: Uint8Array): boolean {
-  // WebCodecs emits AVC samples as four-byte length-prefixed NAL units when
-  // `avc.format` is `avc`. A few Windows drivers have reported an IDR sample
-  // as a delta chunk, so verify the bitstream before rejecting it.
   let offset = 0;
   let parsedAvcSample = false;
   while (offset + 4 <= data.byteLength) {
@@ -67,8 +100,6 @@ function containsH264IdrFrame(data: Uint8Array): boolean {
   }
   if (parsedAvcSample && offset === data.byteLength) return false;
 
-  // Be defensive if a driver ignores the requested AVC output format and
-  // returns Annex-B start codes instead.
   for (let index = 0; index + 4 < data.byteLength; index++) {
     const threeByteStart = data[index] === 0 && data[index + 1] === 0 && data[index + 2] === 1;
     const fourByteStart = data[index] === 0 && data[index + 1] === 0
@@ -87,24 +118,177 @@ function normalizeFrameRate(value: number | undefined, fallback = 60): number {
   return Math.max(1, Math.min(240, Math.round(candidate)));
 }
 
+function clampAudioSample(value: number): number {
+  return value > 1 ? 1 : value < -1 ? -1 : value;
+}
+
+function softLimitAudio(value: number): number {
+  if (value >= -0.9 && value <= 0.9) return value;
+  const sign = value < 0 ? -1 : 1;
+  const excess = Math.abs(value) - 0.9;
+  return sign * (0.9 + 0.1 * Math.tanh(excess / 0.1));
+}
+
+function convertAudioDataForEncoder(
+  audioData: AudioData,
+  targetSampleRate: number,
+  targetChannels: number,
+  gain = 1.0,
+): AudioData {
+  const srcChannels = audioData.numberOfChannels;
+  const srcFrames = audioData.numberOfFrames;
+  const srcRate = audioData.sampleRate;
+
+  const srcPlanes: Float32Array[] = [];
+  for (let ch = 0; ch < srcChannels; ch++) {
+    const plane = new Float32Array(srcFrames);
+    audioData.copyTo(plane, { planeIndex: ch, format: 'f32-planar' });
+    srcPlanes.push(plane);
+  }
+
+  const mappedPlanes: Float32Array[] = [];
+  if (targetChannels === 1) {
+    if (srcChannels === 1) {
+      mappedPlanes.push(srcPlanes[0]);
+    } else {
+      const mono = new Float32Array(srcFrames);
+      const scale = 1 / Math.min(srcChannels, 2);
+      for (let i = 0; i < srcFrames; i++) {
+        mono[i] = clampAudioSample((srcPlanes[0][i] + srcPlanes[1][i]) * scale);
+      }
+      mappedPlanes.push(mono);
+    }
+  } else {
+    if (srcChannels === 1) {
+      mappedPlanes.push(srcPlanes[0], srcPlanes[0]);
+    } else if (srcChannels === 2) {
+      mappedPlanes.push(srcPlanes[0], srcPlanes[1]);
+    } else if (srcChannels >= 6) {
+      const left = new Float32Array(srcFrames);
+      const right = new Float32Array(srcFrames);
+      const hasBack = srcChannels >= 8;
+      for (let i = 0; i < srcFrames; i++) {
+        const l = srcPlanes[0][i];
+        const r = srcPlanes[1][i];
+        const c = srcPlanes[2][i] * 0.7071;
+        const ls = srcPlanes[4][i] * 0.7071;
+        const rs = srcPlanes[5][i] * 0.7071;
+        const lb = hasBack ? srcPlanes[6][i] * 0.5 : 0;
+        const rb = hasBack ? srcPlanes[7][i] * 0.5 : 0;
+        left[i] = clampAudioSample((l + c + ls + lb) * 0.75);
+        right[i] = clampAudioSample((r + c + rs + rb) * 0.75);
+      }
+      mappedPlanes.push(left, right);
+    } else {
+      mappedPlanes.push(srcPlanes[0], srcPlanes[1]);
+    }
+  }
+
+  const outFrames = srcRate === targetSampleRate
+    ? srcFrames
+    : Math.max(1, Math.round((srcFrames * targetSampleRate) / srcRate));
+  const planarData = new Float32Array(outFrames * targetChannels);
+
+  for (let ch = 0; ch < targetChannels; ch++) {
+    const src = mappedPlanes[ch];
+    const dstOffset = ch * outFrames;
+    if (srcRate === targetSampleRate) {
+      if (gain === 1.0) {
+        planarData.set(src, dstOffset);
+      } else {
+        for (let i = 0; i < outFrames; i++) {
+          planarData[dstOffset + i] = src[i] * gain;
+        }
+      }
+    } else {
+      const ratio = srcFrames / outFrames;
+      for (let i = 0; i < outFrames; i++) {
+        const srcPos = i * ratio;
+        const idx0 = Math.floor(srcPos);
+        const idx1 = Math.min(srcFrames - 1, idx0 + 1);
+        const frac = srcPos - idx0;
+        planarData[dstOffset + i] = (src[idx0] * (1 - frac) + src[idx1] * frac) * gain;
+      }
+    }
+  }
+
+  return new AudioData({
+    format: 'f32-planar',
+    sampleRate: targetSampleRate,
+    numberOfChannels: targetChannels,
+    numberOfFrames: outFrames,
+    timestamp: audioData.timestamp,
+    data: planarData,
+  });
+}
+
+async function selectSupportedAudioConfig(
+  preferredRate: number,
+  preferredChannels: number,
+  targetBitrate: number,
+): Promise<{ config: AudioEncoderConfig; codec: 'aac' | 'opus' } | null> {
+  const aacBitrates = Array.from(new Set([targetBitrate, 384_000, 320_000, 256_000, 192_000, 128_000, 96_000]));
+  const opusBitrates = Array.from(new Set([Math.min(targetBitrate, 256_000), 192_000, 128_000, 96_000, 64_000]));
+  const ratesToTest = Array.from(new Set([preferredRate === 44_100 ? 44_100 : 48_000, 48_000, 44_100]));
+  const channelsToTest = Array.from(new Set([preferredChannels === 1 ? 1 : 2, 2, 1]));
+
+  for (const rate of ratesToTest) {
+    for (const ch of channelsToTest) {
+      for (const bitrate of aacBitrates) {
+        const candidate: AudioEncoderConfig = {
+          codec: 'mp4a.40.2',
+          sampleRate: rate,
+          numberOfChannels: ch,
+          bitrate,
+        };
+        try {
+          const support = await AudioEncoder.isConfigSupported(candidate);
+          if (support.supported) {
+            return { config: support.config || candidate, codec: 'aac' };
+          }
+        } catch {}
+      }
+    }
+  }
+
+  for (const rate of ratesToTest) {
+    for (const ch of channelsToTest) {
+      for (const bitrate of opusBitrates) {
+        const candidate: AudioEncoderConfig = {
+          codec: 'opus',
+          sampleRate: rate,
+          numberOfChannels: ch,
+          bitrate,
+        };
+        try {
+          const support = await AudioEncoder.isConfigSupported(candidate);
+          if (support.supported) {
+            return { config: support.config || candidate, codec: 'opus' };
+          }
+        } catch {}
+      }
+    }
+  }
+
+  return null;
+}
+
 /**
- * Keeps encoded H.264/AAC chunks in a timestamped ring and muxes a fresh,
- * seekable MP4 when a clip is requested. Unlike MediaRecorder timeslices,
- * every retained window starts on a known video keyframe.
+ * Keeps encoded H.264 video and completely separated Windows/Mic audio rings in memory,
+ * muxing standalone `.m4a` track files plus a seekable MP4 when clipped.
  */
 export class Mp4RollingEncoder {
   private readonly maxDurationUs: number;
   private readonly requestedFrameRate: number;
 
   private videoEncoder: VideoEncoder | null = null;
-  private audioEncoder: AudioEncoder | null = null;
   private videoReader: ReadableStreamDefaultReader<VideoFrame> | null = null;
-  private audioReader: ReadableStreamDefaultReader<AudioData> | null = null;
 
   private videoChunks: StoredVideoChunk[] = [];
-  private audioChunks: StoredAudioChunk[] = [];
   private videoDecoderConfig: VideoDecoderConfig | null = null;
-  private audioDecoderConfig: AudioDecoderConfig | null = null;
+
+  private gameRing: SeparatedTrackRing = createSeparatedTrackRing('game');
+  private micRing: SeparatedTrackRing = createSeparatedTrackRing('mic');
 
   private running = false;
   private paused = false;
@@ -113,16 +297,14 @@ export class Mp4RollingEncoder {
   private width = 0;
   private height = 0;
   private configuredFrameRate = 60;
-  private configuredAudioSampleRate = 48_000;
-  private configuredAudioChannels = 2;
-  private configuredAudioCodec: 'aac' | 'opus' = 'aac';
   private videoReadTask: Promise<void> | null = null;
-  private audioReadTask: Promise<void> | null = null;
   private startupReadyPromise: Promise<void> | null = null;
   private resolveStartupReady: (() => void) | null = null;
   private rejectStartupReady: ((error: Error) => void) | null = null;
   private encoderError: Error | null = null;
-  private streamTimestampOrigin: number | null = null;
+  private sessionStartPerfMs = 0;
+  private videoInputOriginUs: number | null = null;
+  private videoBaseOffsetUs = 0;
   private lastVideoChunkAt = 0;
 
   constructor(durationSeconds: number, requestedFrameRate: number) {
@@ -138,7 +320,10 @@ export class Mp4RollingEncoder {
     );
   }
 
-  public async start(videoTrack: MediaStreamTrack, audioTrack?: MediaStreamTrack | null): Promise<void> {
+  public async start(
+    videoTrack: MediaStreamTrack,
+    audioInput?: MediaStreamTrack | SeparatedAudioTracks | null,
+  ): Promise<void> {
     if (!Mp4RollingEncoder.isAvailable()) {
       throw new Error('WebCodecs or MediaStreamTrackProcessor is unavailable.');
     }
@@ -155,19 +340,28 @@ export class Mp4RollingEncoder {
     this.videoReader = videoProcessor.readable.getReader();
 
     this.running = true;
+    this.sessionStartPerfMs = performance.now();
+    this.videoInputOriginUs = null;
+    this.videoBaseOffsetUs = 0;
     this.videoReadTask = this.readVideoFrames();
 
-    // Start AAC alongside the video processor. Starting it only after H.264
-    // warm-up could shift audio by several seconds when an encoder profile had
-    // to fall back.
-    if (audioTrack && globalThis.AudioEncoder && globalThis.EncodedAudioChunk) {
-      await this.tryStartAudio(audioTrack, Processor);
+    const separatedTracks: SeparatedAudioTracks = audioInput instanceof MediaStreamTrack
+      ? { gameAudioTrack: audioInput, micAudioTrack: null }
+      : {
+          gameAudioTrack: audioInput?.gameAudioTrack ?? null,
+          micAudioTrack: audioInput?.micAudioTrack ?? null,
+        };
+
+    if (globalThis.AudioEncoder && globalThis.EncodedAudioChunk) {
+      const targetBitrate = audioMixer.getConfig().audioBitrate || 256_000;
+      if (separatedTracks.gameAudioTrack?.readyState === 'live') {
+        await this.startSeparatedAudioRing(this.gameRing, separatedTracks.gameAudioTrack, Processor, targetBitrate);
+      }
+      if (separatedTracks.micAudioTrack?.readyState === 'live') {
+        await this.startSeparatedAudioRing(this.micRing, separatedTracks.micAudioTrack, Processor, targetBitrate);
+      }
     }
 
-    // Do not tell the UI that the buffer is active until Windows has actually
-    // produced a muxable IDR frame and AVC decoder configuration. Some GPU
-    // drivers accept one H.264 profile and then fail asynchronously, so retry
-    // the other supported profiles before giving up.
     let startupFailure: Error | null = null;
     for (const videoConfig of videoConfigs) {
       this.resetVideoAttempt();
@@ -196,7 +390,6 @@ export class Mp4RollingEncoder {
     if (startupFailure || !this.hasUsableKeyframe()) {
       throw startupFailure || new Error('No supported Windows H.264 encoder produced a usable keyframe.');
     }
-
   }
 
   public pause(): void {
@@ -206,8 +399,6 @@ export class Mp4RollingEncoder {
   public resume(): void {
     if (!this.paused) return;
     this.paused = false;
-    // Resuming must never discard the rolling history. Request a fresh IDR so
-    // the next snapshot can choose a recent, independently decodable boundary.
     this.lastKeyframeTimestamp = Number.NEGATIVE_INFINITY;
   }
 
@@ -216,17 +407,11 @@ export class Mp4RollingEncoder {
       throw this.encoderError || new Error('The H.264 encoder is not running.');
     }
 
-    // flush() must happen before inspecting the ring: hardware encoders can
-    // retain several seconds of output internally even though input is live.
     await this.videoEncoder.flush();
-    if (this.audioEncoder?.state === 'configured') {
-      await this.audioEncoder.flush();
-    }
+    if (this.gameRing.encoder?.state === 'configured') await this.gameRing.encoder.flush();
+    if (this.micRing.encoder?.state === 'configured') await this.micRing.encoder.flush();
 
     if (!this.hasUsableKeyframe()) {
-      // This is most often reached immediately after leaving review, when the
-      // ring intentionally starts a fresh timestamp epoch. Force the next
-      // input to be an IDR and allow the live track a brief recovery window.
       this.lastKeyframeTimestamp = Number.NEGATIVE_INFINITY;
       await this.waitForUsableKeyframe(2_000);
       await this.videoEncoder.flush();
@@ -247,15 +432,13 @@ export class Mp4RollingEncoder {
     let desiredStart = newestTimestamp - this.maxDurationUs;
     let startIndex = chunks.findIndex(chunk => chunk.type === 'key' && chunk.timestamp >= desiredStart);
 
-    // Never fall back directly to the oldest keyframe. If the encoder missed
-    // its periodic IDRs, request one now so the clip still ends at "now" and
-    // remains bounded by the configured rolling duration.
     if (startIndex < 0 && this.running && !this.paused) {
       const previousNewestTimestamp = newestTimestamp;
       this.lastKeyframeTimestamp = Number.NEGATIVE_INFINITY;
       await this.waitForKeyframeAfter(previousNewestTimestamp, 2_000);
       await this.videoEncoder.flush();
-      if (this.audioEncoder?.state === 'configured') await this.audioEncoder.flush();
+      if (this.gameRing.encoder?.state === 'configured') await this.gameRing.encoder.flush();
+      if (this.micRing.encoder?.state === 'configured') await this.micRing.encoder.flush();
 
       chunks = [...this.videoChunks];
       newestTimestamp = chunks[chunks.length - 1].timestamp;
@@ -283,20 +466,73 @@ export class Mp4RollingEncoder {
     const outputFrameRate = normalizeFrameRate(this.configuredFrameRate, this.requestedFrameRate);
     const lastVideoChunk = videoChunks[videoChunks.length - 1];
     const endTimestamp = lastVideoChunk.timestamp + (lastVideoChunk.duration || Math.round(1_000_000 / outputFrameRate));
-    
-    // Select all audio chunks that overlap with the active clip window
-    const audioChunks = this.audioChunks.filter(chunk => 
-      (chunk.timestamp + (chunk.duration || 0)) >= startTimestamp && chunk.timestamp <= (endTimestamp + 500_000)
+
+    const gameWindowChunks = this.gameRing.chunks.filter(
+      chunk => chunk.timestamp >= startTimestamp && chunk.timestamp <= endTimestamp,
     );
+    const micWindowChunks = this.micRing.chunks.filter(
+      chunk => chunk.timestamp >= startTimestamp && chunk.timestamp <= endTimestamp,
+    );
+
+    const gameAudioBlob = this.muxAudioOnlyBlob(this.gameRing, gameWindowChunks, startTimestamp);
+    const micAudioBlob = this.muxAudioOnlyBlob(this.micRing, micWindowChunks, startTimestamp);
+
+    // Prepare the embedded MP4 audio track (offline sample-accurate mix if both tracks exist)
+    let embeddedCodec: 'aac' | 'opus' = 'aac';
+    let embeddedSampleRate = 48_000;
+    let embeddedChannels = 2;
+    let embeddedDecoderConfig: AudioDecoderConfig | null = null;
+    let embeddedChunks: StoredAudioChunk[] = [];
+
+    if (gameAudioBlob && micAudioBlob) {
+      const gameOffsetSec = Math.max(0, (gameWindowChunks[0].timestamp - startTimestamp) / 1_000_000);
+      const micOffsetSec = Math.max(0, (micWindowChunks[0].timestamp - startTimestamp) / 1_000_000);
+      const mixed = await this.mixAudioBlobsOffline(
+        gameAudioBlob,
+        micAudioBlob,
+        gameOffsetSec,
+        micOffsetSec,
+        audioMixer.getConfig().audioBitrate || 256_000,
+      );
+      if (mixed) {
+        embeddedCodec = mixed.codec;
+        embeddedSampleRate = mixed.sampleRate;
+        embeddedChannels = mixed.channels;
+        embeddedDecoderConfig = mixed.decoderConfig;
+        embeddedChunks = mixed.chunks;
+      } else {
+        // Safe fallback to Windows audio track if offline decode fails
+        embeddedCodec = this.gameRing.codec;
+        embeddedSampleRate = this.gameRing.decoderConfig?.sampleRate || this.gameRing.sampleRate;
+        embeddedChannels = this.gameRing.decoderConfig?.numberOfChannels || this.gameRing.channels;
+        embeddedDecoderConfig = this.gameRing.decoderConfig;
+        embeddedChunks = gameWindowChunks;
+      }
+    } else if (gameWindowChunks.length > 0) {
+      embeddedCodec = this.gameRing.codec;
+      embeddedSampleRate = this.gameRing.decoderConfig?.sampleRate || this.gameRing.sampleRate;
+      embeddedChannels = this.gameRing.decoderConfig?.numberOfChannels || this.gameRing.channels;
+      embeddedDecoderConfig = this.gameRing.decoderConfig;
+      embeddedChunks = gameWindowChunks;
+    } else if (micWindowChunks.length > 0) {
+      embeddedCodec = this.micRing.codec;
+      embeddedSampleRate = this.micRing.decoderConfig?.sampleRate || this.micRing.sampleRate;
+      embeddedChannels = this.micRing.decoderConfig?.numberOfChannels || this.micRing.channels;
+      embeddedDecoderConfig = this.micRing.decoderConfig;
+      embeddedChunks = micWindowChunks;
+    }
+
     const measuredDurationUs = Math.max(
       ...videoChunks.map(chunk => chunk.timestamp + (chunk.duration || 0)),
-      ...audioChunks.map(chunk => chunk.timestamp + (chunk.duration || 0)),
+      ...gameWindowChunks.map(chunk => chunk.timestamp + (chunk.duration || 0)),
+      ...micWindowChunks.map(chunk => chunk.timestamp + (chunk.duration || 0)),
     ) - startTimestamp;
     const durationSeconds = Math.max(0.001, measuredDurationUs / 1_000_000);
 
-    const audioSampleRate = this.audioDecoderConfig?.sampleRate || this.configuredAudioSampleRate || 48_000;
-    const audioChannels = this.audioDecoderConfig?.numberOfChannels || this.configuredAudioChannels || 2;
-    const hasAudio = audioChunks.length > 0;
+    const hasEmbeddedAudio = embeddedChunks.length > 0;
+    const fallbackAudioDurationUs = Math.round(
+      ((embeddedCodec === 'aac' ? 1024 : 960) / embeddedSampleRate) * 1_000_000,
+    );
 
     const target = new ArrayBufferTarget();
     const muxer = new Muxer({
@@ -307,12 +543,12 @@ export class Mp4RollingEncoder {
         height: this.height,
         frameRate: outputFrameRate,
       },
-      ...(hasAudio
+      ...(hasEmbeddedAudio
         ? {
             audio: {
-              codec: this.configuredAudioCodec,
-              numberOfChannels: audioChannels,
-              sampleRate: audioSampleRate,
+              codec: embeddedCodec,
+              numberOfChannels: embeddedChannels,
+              sampleRate: embeddedSampleRate,
             },
           }
         : {}),
@@ -338,24 +574,27 @@ export class Mp4RollingEncoder {
       );
     });
 
-    if (hasAudio) {
-      audioChunks.forEach((chunk, index) => {
-        const metadata = index === 0 && this.audioDecoderConfig
+    if (hasEmbeddedAudio) {
+      const alreadyRelative = Boolean(gameAudioBlob && micAudioBlob && embeddedChunks !== gameWindowChunks);
+      let lastRelativeAudioTime = -1;
+      embeddedChunks.forEach((chunk, index) => {
+        const metadata = index === 0 && embeddedDecoderConfig
           ? {
               decoderConfig: {
-                ...this.audioDecoderConfig,
-                description: copyDescription(this.audioDecoderConfig.description),
+                ...embeddedDecoderConfig,
+                description: copyDescription(embeddedDecoderConfig.description),
               },
             }
           : undefined;
-        const relativeTime = Math.max(0, chunk.timestamp - startTimestamp);
-        muxer.addAudioChunkRaw(
-          chunk.data,
-          chunk.type,
-          relativeTime,
-          chunk.duration,
-          metadata,
-        );
+        const duration = chunk.duration > 0 ? chunk.duration : fallbackAudioDurationUs;
+        let relativeTime = alreadyRelative
+          ? Math.max(0, chunk.timestamp)
+          : Math.max(0, chunk.timestamp - startTimestamp);
+        if (relativeTime <= lastRelativeAudioTime) {
+          relativeTime = lastRelativeAudioTime + Math.max(1, duration);
+        }
+        lastRelativeAudioTime = relativeTime;
+        muxer.addAudioChunkRaw(chunk.data, chunk.type, relativeTime, duration, metadata);
       });
     }
 
@@ -363,6 +602,8 @@ export class Mp4RollingEncoder {
 
     return {
       blob: new Blob([target.buffer], { type: 'video/mp4' }),
+      gameAudioBlob,
+      micAudioBlob,
       durationSeconds,
       frameRate: outputFrameRate,
       width: this.width,
@@ -371,28 +612,220 @@ export class Mp4RollingEncoder {
     };
   }
 
+  private muxAudioOnlyBlob(
+    ring: SeparatedTrackRing,
+    windowChunks: StoredAudioChunk[],
+    startTimestamp: number,
+  ): Blob | undefined {
+    if (windowChunks.length === 0) return undefined;
+
+    const sampleRate = ring.decoderConfig?.sampleRate || ring.sampleRate || 48_000;
+    const channels = ring.decoderConfig?.numberOfChannels || ring.channels || 2;
+    const fallbackDurationUs = Math.round(((ring.codec === 'aac' ? 1024 : 960) / sampleRate) * 1_000_000);
+
+    const target = new ArrayBufferTarget();
+    const muxer = new Muxer({
+      target,
+      audio: {
+        codec: ring.codec,
+        numberOfChannels: channels,
+        sampleRate,
+      },
+      fastStart: 'in-memory',
+      firstTimestampBehavior: 'offset',
+    });
+
+    let lastRelativeTime = -1;
+    windowChunks.forEach((chunk, index) => {
+      const metadata = index === 0 && ring.decoderConfig
+        ? {
+            decoderConfig: {
+              ...ring.decoderConfig,
+              description: copyDescription(ring.decoderConfig.description),
+            },
+          }
+        : undefined;
+      const duration = chunk.duration > 0 ? chunk.duration : fallbackDurationUs;
+      let relativeTime = Math.max(0, chunk.timestamp - startTimestamp);
+      if (relativeTime <= lastRelativeTime) {
+        relativeTime = lastRelativeTime + Math.max(1, duration);
+      }
+      lastRelativeTime = relativeTime;
+      muxer.addAudioChunkRaw(chunk.data, chunk.type, relativeTime, duration, metadata);
+    });
+
+    muxer.finalize();
+    return new Blob([target.buffer], { type: 'audio/mp4' });
+  }
+
+  private async mixAudioBlobsOffline(
+    gameBlob: Blob,
+    micBlob: Blob,
+    gameOffsetSec: number,
+    micOffsetSec: number,
+    targetBitrate: number,
+  ): Promise<{
+    codec: 'aac' | 'opus';
+    sampleRate: number;
+    channels: number;
+    decoderConfig: AudioDecoderConfig | null;
+    chunks: StoredAudioChunk[];
+  } | null> {
+    const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
+    if (!AudioCtxClass || !globalThis.AudioEncoder || !globalThis.AudioData) return null;
+
+    const audioCtx = new AudioCtxClass();
+    try {
+      const [gameArr, micArr] = await Promise.all([gameBlob.arrayBuffer(), micBlob.arrayBuffer()]);
+      const [gameBuf, micBuf] = await Promise.all([
+        audioCtx.decodeAudioData(gameArr),
+        audioCtx.decodeAudioData(micArr),
+      ]);
+
+      const sampleRate = gameBuf.sampleRate === 44_100 ? 44_100 : 48_000;
+      const channels = 2;
+      const selected = await selectSupportedAudioConfig(sampleRate, channels, targetBitrate);
+      if (!selected) return null;
+
+      const encSampleRate = selected.config.sampleRate;
+      const encChannels = selected.config.numberOfChannels;
+
+      const gStart = Math.round(gameOffsetSec * encSampleRate);
+      const mStart = Math.round(micOffsetSec * encSampleRate);
+      const gLen = Math.round((gameBuf.length * encSampleRate) / gameBuf.sampleRate);
+      const mLen = Math.round((micBuf.length * encSampleRate) / micBuf.sampleRate);
+      const totalSamples = Math.max(gStart + gLen, mStart + mLen);
+      if (totalSamples <= 0) return null;
+
+      const outChunks: StoredAudioChunk[] = [];
+      let outDecoderConfig: AudioDecoderConfig | null = null;
+      const fallbackDur = Math.round(((selected.codec === 'aac' ? 1024 : 960) / encSampleRate) * 1_000_000);
+
+      const encoder = new AudioEncoder({
+        output: (chunk, metadata) => {
+          if (metadata?.decoderConfig) {
+            outDecoderConfig = {
+              ...metadata.decoderConfig,
+              description: copyDescription(metadata.decoderConfig.description),
+            };
+          }
+          outChunks.push({
+            type: chunk.type,
+            timestamp: Math.max(0, chunk.timestamp),
+            duration: chunk.duration && chunk.duration > 0 ? chunk.duration : fallbackDur,
+            data: copyChunk(chunk),
+          });
+        },
+        error: err => console.warn('Offline snapshot audio mix encoder error:', err),
+      });
+      encoder.configure(selected.config);
+
+      const gRatio = gameBuf.sampleRate / encSampleRate;
+      const mRatio = micBuf.sampleRate / encSampleRate;
+      const frameSize = 1024;
+
+      for (let offset = 0; offset < totalSamples; offset += frameSize) {
+        const count = Math.min(frameSize, totalSamples - offset);
+        const planarData = new Float32Array(count * encChannels);
+
+        for (let ch = 0; ch < encChannels; ch++) {
+          const gSrc = gameBuf.getChannelData(Math.min(ch, gameBuf.numberOfChannels - 1));
+          const mSrc = micBuf.getChannelData(Math.min(ch, micBuf.numberOfChannels - 1));
+          const dstOffset = ch * count;
+
+          for (let i = 0; i < count; i++) {
+            const globalIdx = offset + i;
+            let gVal = 0;
+            const gIdx = globalIdx - gStart;
+            if (gIdx >= 0 && gIdx < gLen) {
+              if (gameBuf.sampleRate === encSampleRate) {
+                gVal = gSrc[gIdx] || 0;
+              } else {
+                const pos = gIdx * gRatio;
+                const i0 = Math.floor(pos);
+                if (i0 < gSrc.length) {
+                  const i1 = Math.min(gSrc.length - 1, i0 + 1);
+                  const frac = pos - i0;
+                  gVal = gSrc[i0] * (1 - frac) + gSrc[i1] * frac;
+                }
+              }
+            }
+
+            let mVal = 0;
+            const mIdx = globalIdx - mStart;
+            if (mIdx >= 0 && mIdx < mLen) {
+              if (micBuf.sampleRate === encSampleRate) {
+                mVal = mSrc[mIdx] || 0;
+              } else {
+                const pos = mIdx * mRatio;
+                const i0 = Math.floor(pos);
+                if (i0 < mSrc.length) {
+                  const i1 = Math.min(mSrc.length - 1, i0 + 1);
+                  const frac = pos - i0;
+                  mVal = mSrc[i0] * (1 - frac) + mSrc[i1] * frac;
+                }
+              }
+            }
+
+            planarData[dstOffset + i] = softLimitAudio(gVal + mVal);
+          }
+        }
+
+        const audioData = new AudioData({
+          format: 'f32-planar',
+          sampleRate: encSampleRate,
+          numberOfChannels: encChannels,
+          numberOfFrames: count,
+          timestamp: Math.round((offset / encSampleRate) * 1_000_000),
+          data: planarData,
+        });
+        encoder.encode(audioData);
+        audioData.close();
+      }
+
+      await encoder.flush();
+      encoder.close();
+
+      return {
+        codec: selected.codec,
+        sampleRate: encSampleRate,
+        channels: encChannels,
+        decoderConfig: outDecoderConfig,
+        chunks: outChunks,
+      };
+    } catch (err) {
+      console.warn('Offline audio mix failed, falling back to single track:', err);
+      return null;
+    } finally {
+      try { await audioCtx.close(); } catch {}
+    }
+  }
+
   public stop(): void {
     this.running = false;
     void this.videoReader?.cancel().catch(() => undefined);
-    void this.audioReader?.cancel().catch(() => undefined);
+    void this.gameRing.reader?.cancel().catch(() => undefined);
+    void this.micRing.reader?.cancel().catch(() => undefined);
     this.videoReader = null;
-    this.audioReader = null;
 
     if (this.videoEncoder && this.videoEncoder.state !== 'closed') {
       this.videoEncoder.close();
     }
-    if (this.audioEncoder && this.audioEncoder.state !== 'closed') {
-      this.audioEncoder.close();
+    if (this.gameRing.encoder && this.gameRing.encoder.state !== 'closed') {
+      this.gameRing.encoder.close();
+    }
+    if (this.micRing.encoder && this.micRing.encoder.state !== 'closed') {
+      this.micRing.encoder.close();
     }
     this.videoEncoder = null;
-    this.audioEncoder = null;
     this.videoChunks = [];
-    this.audioChunks = [];
     this.videoDecoderConfig = null;
-    this.audioDecoderConfig = null;
+    this.gameRing = createSeparatedTrackRing('game');
+    this.micRing = createSeparatedTrackRing('mic');
     this.videoReadTask = null;
-    this.audioReadTask = null;
-    this.streamTimestampOrigin = null;
+    this.sessionStartPerfMs = 0;
+    this.videoInputOriginUs = null;
+    this.videoBaseOffsetUs = 0;
     this.lastVideoChunkAt = 0;
     this.resolveStartupReady = null;
     this.rejectStartupReady = null;
@@ -415,7 +848,8 @@ export class Mp4RollingEncoder {
     const lastChunk = this.videoChunks[this.videoChunks.length - 1];
     const durationSeconds = Math.max(0, lastChunk.timestamp + lastChunk.duration - firstTimestamp) / 1_000_000;
     const bytes = this.videoChunks.reduce((total, chunk) => total + chunk.data.byteLength, 0)
-      + this.audioChunks.reduce((total, chunk) => total + chunk.data.byteLength, 0);
+      + this.gameRing.chunks.reduce((total, chunk) => total + chunk.data.byteLength, 0)
+      + this.micRing.chunks.reduce((total, chunk) => total + chunk.data.byteLength, 0);
     return { durationSeconds, chunkCount: this.videoChunks.length, bytes };
   }
 
@@ -442,9 +876,7 @@ export class Mp4RollingEncoder {
         try {
           const support = await VideoEncoder.isConfigSupported(config);
           if (support.supported) supportedConfigs.push(support.config || config);
-        } catch {
-          // Try the next H.264 profile or acceleration preference.
-        }
+        } catch {}
       }
     }
 
@@ -454,103 +886,46 @@ export class Mp4RollingEncoder {
     return supportedConfigs;
   }
 
-  private async tryStartAudio(
-    audioTrack: MediaStreamTrack,
+  private async startSeparatedAudioRing(
+    ring: SeparatedTrackRing,
+    track: MediaStreamTrack,
     Processor: TrackProcessorConstructor,
+    targetBitrate: number,
   ): Promise<void> {
     try {
-      const settings = audioTrack.getSettings();
-      const trackSampleRate = settings.sampleRate || 48_000;
+      const settings = track.getSettings();
+      const rawRate = settings.sampleRate || 48_000;
       const trackChannels = Math.min(2, Math.max(1, settings.channelCount || 2));
 
-      const targetBitrate = audioMixer.getConfig().audioBitrate || 256_000;
-      const aacBitrates = Array.from(new Set([targetBitrate, 384_000, 320_000, 256_000, 192_000, 128_000, 96_000]));
-      const opusBitrates = Array.from(new Set([Math.min(targetBitrate, 256_000), 192_000, 128_000, 96_000, 64_000]));
-
-      const ratesToTest = Array.from(new Set([trackSampleRate, 48_000, 44_100])).filter(r => r > 0);
-      const channelsToTest = Array.from(new Set([trackChannels, 2, 1]));
-
-      let chosenConfig: AudioEncoderConfig | null = null;
-      let chosenCodec: 'aac' | 'opus' = 'aac';
-
-      // 1. Try AAC-LC first with high bitrate options
-      for (const rate of ratesToTest) {
-        for (const ch of channelsToTest) {
-          for (const bitrate of aacBitrates) {
-            const candidate: AudioEncoderConfig = {
-              codec: 'mp4a.40.2',
-              sampleRate: rate,
-              numberOfChannels: ch,
-              bitrate,
-            };
-            try {
-              const support = await AudioEncoder.isConfigSupported(candidate);
-              if (support.supported) {
-                chosenConfig = support.config || candidate;
-                chosenCodec = 'aac';
-                break;
-              }
-            } catch {}
-          }
-          if (chosenConfig) break;
-        }
-        if (chosenConfig) break;
-      }
-
-      // 2. If AAC is not supported, fall back to Opus
-      if (!chosenConfig) {
-        for (const rate of ratesToTest) {
-          for (const ch of channelsToTest) {
-            for (const bitrate of opusBitrates) {
-              const candidate: AudioEncoderConfig = {
-                codec: 'opus',
-                sampleRate: rate,
-                numberOfChannels: ch,
-                bitrate,
-              };
-              try {
-                const support = await AudioEncoder.isConfigSupported(candidate);
-                if (support.supported) {
-                  chosenConfig = support.config || candidate;
-                  chosenCodec = 'opus';
-                  break;
-                }
-              } catch {}
-            }
-            if (chosenConfig) break;
-          }
-          if (chosenConfig) break;
-        }
-      }
-
-      if (!chosenConfig) {
-        console.warn('Neither AAC nor Opus audio encoding is supported on this platform; MP4 clips will be video-only.');
+      const selected = await selectSupportedAudioConfig(rawRate, trackChannels, targetBitrate);
+      if (!selected) {
+        console.warn(`No supported AudioEncoder config for ${ring.kind} track.`);
         return;
       }
 
-      this.configuredAudioCodec = chosenCodec;
-      this.configuredAudioSampleRate = chosenConfig.sampleRate;
-      this.configuredAudioChannels = chosenConfig.numberOfChannels;
+      ring.codec = selected.codec;
+      ring.sampleRate = selected.config.sampleRate;
+      ring.channels = selected.config.numberOfChannels;
 
-      this.audioEncoder = new AudioEncoder({
-        output: (chunk, metadata) => this.handleAudioChunk(chunk, metadata),
+      ring.encoder = new AudioEncoder({
+        output: (chunk, metadata) => this.handleSeparatedAudioChunk(ring, chunk, metadata),
         error: error => {
-          console.error('MP4 audio encoder error:', error instanceof Error ? error.message : String(error));
+          console.error(`MP4 ${ring.kind} audio encoder error:`, error instanceof Error ? error.message : String(error));
         },
       });
-      this.audioEncoder.configure(chosenConfig);
+      ring.encoder.configure(selected.config);
 
-      const audioProcessor = new Processor<AudioData>({ track: audioTrack, maxBufferSize: 16 });
-      this.audioReader = audioProcessor.readable.getReader();
-      this.audioReadTask = this.readAudioFrames();
-      console.log(`[Mp4RollingEncoder] Audio pipeline initialized: ${chosenCodec} @ ${this.configuredAudioSampleRate}Hz, ${this.configuredAudioChannels}ch`);
+      const processor = new Processor<AudioData>({ track, maxBufferSize: 16 });
+      ring.reader = processor.readable.getReader();
+      ring.readTask = this.readSeparatedAudioFrames(ring);
+      console.log(`[Mp4RollingEncoder] Separated ${ring.kind} audio initialized: ${ring.codec} @ ${ring.sampleRate}Hz, ${ring.channels}ch`);
     } catch (error) {
-      console.warn('Unable to initialize audio capture; MP4 clips will be video-only:', error);
-      if (this.audioEncoder && this.audioEncoder.state !== 'closed') {
-        this.audioEncoder.close();
+      console.warn(`Unable to initialize ${ring.kind} audio capture:`, error);
+      if (ring.encoder && ring.encoder.state !== 'closed') {
+        ring.encoder.close();
       }
-      this.audioEncoder = null;
-      this.audioReader = null;
+      ring.encoder = null;
+      ring.reader = null;
     }
   }
 
@@ -561,6 +936,10 @@ export class Mp4RollingEncoder {
         if (done || !frame) break;
 
         try {
+          if (this.videoInputOriginUs === null) {
+            this.videoInputOriginUs = frame.timestamp;
+            this.videoBaseOffsetUs = Math.max(0, Math.round((performance.now() - this.sessionStartPerfMs) * 1000));
+          }
           if (this.paused || !this.videoEncoder || this.videoEncoder.state !== 'configured') continue;
           if (this.videoEncoder.encodeQueueSize > 8) {
             this.droppedFrames++;
@@ -580,83 +959,67 @@ export class Mp4RollingEncoder {
     }
   }
 
-  private async readAudioFrames(): Promise<void> {
-    while (this.running && this.audioReader) {
-      const { value: audioData, done } = await this.audioReader.read();
+  private async readSeparatedAudioFrames(ring: SeparatedTrackRing): Promise<void> {
+    let lastGameMeterAt = 0;
+    let meterScratch = new Float32Array(2048);
+
+    while (this.running && ring.reader) {
+      const { value: audioData, done } = await ring.reader.read();
       if (done || !audioData) break;
       try {
-        if (this.paused) continue;
+        if (ring.inputOriginUs === null) {
+          ring.inputOriginUs = audioData.timestamp;
+          ring.baseOffsetUs = Math.max(0, Math.round((performance.now() - this.sessionStartPerfMs) * 1000));
+        }
+        if (this.paused || audioData.numberOfFrames === 0) continue;
+        if (!ring.encoder || ring.encoder.state !== 'configured') continue;
+        if (ring.encoder.encodeQueueSize > 32) continue;
 
-        if (
-          !this.audioEncoder ||
-          this.audioEncoder.state !== 'configured' ||
-          this.configuredAudioSampleRate !== audioData.sampleRate ||
-          this.configuredAudioChannels !== audioData.numberOfChannels
-        ) {
-          try {
-            const frameSampleRate = audioData.sampleRate;
-            const frameChannels = Math.min(2, Math.max(1, audioData.numberOfChannels));
-            let chosenConfig: AudioEncoderConfig | null = null;
-            let chosenCodec: 'aac' | 'opus' = this.configuredAudioCodec;
+        let gain = 1.0;
+        if (ring.kind === 'game') {
+          const cfg = audioMixer.getConfig();
+          gain = cfg.isGameAudioMuted ? 0 : Math.max(0, Math.min(1, cfg.gameVolume));
 
-            const targetBitrate = audioMixer.getConfig().audioBitrate || 256_000;
-            const aacBitrates = Array.from(new Set([targetBitrate, 384_000, 320_000, 256_000, 192_000, 128_000, 96_000]));
-            const opusBitrates = Array.from(new Set([Math.min(targetBitrate, 256_000), 192_000, 128_000, 96_000, 64_000]));
-
-            const codecsToTry = this.configuredAudioCodec === 'aac'
-              ? [
-                  { codec: 'mp4a.40.2' as const, rate: frameSampleRate, bitrates: aacBitrates },
-                  { codec: 'opus' as const, rate: frameSampleRate, bitrates: opusBitrates },
-                ]
-              : [
-                  { codec: 'opus' as const, rate: frameSampleRate, bitrates: opusBitrates },
-                  { codec: 'mp4a.40.2' as const, rate: frameSampleRate, bitrates: aacBitrates },
-                ];
-
-            for (const { codec, rate, bitrates } of codecsToTry) {
-              for (const bitrate of bitrates) {
-                const candidate: AudioEncoderConfig = {
-                  codec,
-                  sampleRate: rate,
-                  numberOfChannels: frameChannels,
-                  bitrate,
-                };
-                const support = await AudioEncoder.isConfigSupported(candidate);
-                if (support.supported) {
-                  chosenConfig = support.config || candidate;
-                  chosenCodec = codec === 'opus' ? 'opus' : 'aac';
-                  break;
-                }
+          const now = performance.now();
+          if (now - lastGameMeterAt >= 40) {
+            lastGameMeterAt = now;
+            if (gain <= 0) {
+              audioMixer.reportGameAudioLevel(-80);
+            } else {
+              const frames = audioData.numberOfFrames;
+              if (meterScratch.length < frames) {
+                meterScratch = new Float32Array(frames);
               }
-              if (chosenConfig) break;
-            }
-
-            if (chosenConfig) {
-              if (this.audioEncoder && this.audioEncoder.state !== 'closed') {
-                try { this.audioEncoder.close(); } catch {}
+              const view = meterScratch.subarray(0, frames);
+              audioData.copyTo(view, { planeIndex: 0, format: 'f32-planar' });
+              let sumSq = 0;
+              for (let i = 0; i < frames; i++) {
+                const s = view[i] * gain;
+                sumSq += s * s;
               }
-              this.audioEncoder = new AudioEncoder({
-                output: (chunk, metadata) => this.handleAudioChunk(chunk, metadata),
-                error: error => {
-                  console.error('MP4 audio encoder error:', error instanceof Error ? error.message : String(error));
-                },
-              });
-              this.audioEncoder.configure(chosenConfig);
-              this.configuredAudioCodec = chosenCodec;
-              this.configuredAudioSampleRate = frameSampleRate;
-              this.configuredAudioChannels = frameChannels;
-              console.log(`[Mp4RollingEncoder] Audio encoder dynamically reconfigured: ${chosenCodec} @ ${frameSampleRate}Hz, ${frameChannels}ch`);
+              const rms = Math.sqrt(sumSq / frames);
+              const db = Math.max(-80, Math.round(20 * Math.log10(Math.max(rms, 0.0001))));
+              audioMixer.reportGameAudioLevel(db);
             }
-          } catch (cfgErr) {
-            console.warn('AudioEncoder dynamic reconfiguration failed:', cfgErr);
           }
         }
 
-        if (this.audioEncoder && this.audioEncoder.state === 'configured') {
-          this.audioEncoder.encode(audioData);
+        if (
+          gain >= 0.99 &&
+          audioData.sampleRate === ring.sampleRate &&
+          audioData.numberOfChannels === ring.channels
+        ) {
+          ring.encoder.encode(audioData);
+        } else {
+          const normalized = convertAudioDataForEncoder(audioData, ring.sampleRate, ring.channels, gain);
+          try {
+            ring.encoder.encode(normalized);
+          } finally {
+            normalized.close();
+          }
         }
       } catch (encodeErr) {
-        console.warn('Failed to encode audio frame:', encodeErr);
+        console.warn(`Failed to encode ${ring.kind} audio frame:`, encodeErr);
       } finally {
         audioData.close();
       }
@@ -674,8 +1037,10 @@ export class Mp4RollingEncoder {
     const type: EncodedVideoChunkType = chunk.type === 'key' || containsH264IdrFrame(data)
       ? 'key'
       : 'delta';
-    if (this.streamTimestampOrigin === null) this.streamTimestampOrigin = chunk.timestamp;
-    const normalizedTimestamp = Math.max(0, chunk.timestamp - this.streamTimestampOrigin);
+    const normalizedTimestamp = Math.max(
+      0,
+      this.videoBaseOffsetUs + (chunk.timestamp - (this.videoInputOriginUs ?? chunk.timestamp)),
+    );
     this.videoChunks.push({
       type,
       timestamp: normalizedTimestamp,
@@ -691,6 +1056,39 @@ export class Mp4RollingEncoder {
       this.resolveStartupReady = null;
       this.rejectStartupReady = null;
     }
+  }
+
+  private handleSeparatedAudioChunk(
+    ring: SeparatedTrackRing,
+    chunk: EncodedAudioChunk,
+    metadata?: EncodedAudioChunkMetadata,
+  ): void {
+    if (metadata?.decoderConfig) {
+      ring.decoderConfig = {
+        ...metadata.decoderConfig,
+        description: copyDescription(metadata.decoderConfig.description),
+      };
+    }
+    const fallbackDurationUs = Math.round(
+      ((ring.codec === 'aac' ? 1024 : 960) / (ring.sampleRate || 48_000)) * 1_000_000,
+    );
+    const duration = chunk.duration && chunk.duration > 0 ? chunk.duration : fallbackDurationUs;
+    let normalizedTimestamp = Math.max(
+      0,
+      ring.baseOffsetUs + (chunk.timestamp - (ring.inputOriginUs ?? chunk.timestamp)),
+    );
+    if (ring.lastChunkTimestamp !== null && normalizedTimestamp <= ring.lastChunkTimestamp) {
+      normalizedTimestamp = ring.lastChunkTimestamp + Math.max(1, ring.lastChunkDuration || fallbackDurationUs);
+    }
+    ring.lastChunkTimestamp = normalizedTimestamp;
+    ring.lastChunkDuration = duration;
+
+    ring.chunks.push({
+      type: chunk.type,
+      timestamp: normalizedTimestamp,
+      duration,
+      data: copyChunk(chunk),
+    });
   }
 
   private hasUsableKeyframe(): boolean {
@@ -758,22 +1156,12 @@ export class Mp4RollingEncoder {
     });
   }
 
-  private handleAudioChunk(chunk: EncodedAudioChunk, metadata?: EncodedAudioChunkMetadata): void {
-    if (metadata?.decoderConfig) {
-      this.audioDecoderConfig = {
-        ...metadata.decoderConfig,
-        description: copyDescription(metadata.decoderConfig.description),
-      };
-    }
-    if (this.streamTimestampOrigin === null) this.streamTimestampOrigin = chunk.timestamp;
-    this.audioChunks.push({
-      type: chunk.type,
-      timestamp: Math.max(0, chunk.timestamp - this.streamTimestampOrigin),
-      duration: chunk.duration || 0,
-      data: copyChunk(chunk),
-    });
-    if (this.audioChunks.length === 1) {
-      console.log(`[Mp4RollingEncoder] Successfully encoded first audio chunk: codec=${this.configuredAudioCodec}, size=${chunk.byteLength}B, timestamp=${chunk.timestamp}`);
+  private pruneAudioChunks(chunks: StoredAudioChunk[], keepTimestamp: number): void {
+    const audioKeepIndex = chunks.findIndex(chunk => (chunk.timestamp + (chunk.duration || 0)) >= keepTimestamp);
+    if (audioKeepIndex > 0) {
+      chunks.splice(0, audioKeepIndex);
+    } else if (audioKeepIndex === -1 && chunks.length > 0) {
+      chunks.length = 0;
     }
   }
 
@@ -802,10 +1190,8 @@ export class Mp4RollingEncoder {
     if (keepIndex > 0) {
       const keepTimestamp = this.videoChunks[keepIndex].timestamp;
       this.videoChunks.splice(0, keepIndex);
-      const audioKeepIndex = this.audioChunks.findIndex(chunk => (chunk.timestamp + (chunk.duration || 0)) >= keepTimestamp);
-      if (audioKeepIndex > 0) {
-        this.audioChunks.splice(0, audioKeepIndex);
-      }
+      this.pruneAudioChunks(this.gameRing.chunks, keepTimestamp);
+      this.pruneAudioChunks(this.micRing.chunks, keepTimestamp);
     }
   }
 }
